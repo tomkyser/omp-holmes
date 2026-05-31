@@ -1,0 +1,10 @@
+{
+  "name": "omp-holmes",
+  "version": "1.0.0",
+  "description": "A plugin that implements the HOLMES cognitive redirect and reasoning enforcement framework.",
+  "omp": {
+    "extensions": [
+      "./src/main.ts"
+    ]
+  }
+}
