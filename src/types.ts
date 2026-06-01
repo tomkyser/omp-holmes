@@ -138,7 +138,49 @@ export interface ImpactFloor {
   reason: string;
   source: ImpactSignalSource;
   evidenceRefs: EvidenceRef[];
-  overridableByModel: false;
+  overridableByModel: boolean;
+}
+
+export type RiskKind =
+  | "auth_security_change"
+  | "crypto_secret_change"
+  | "data_migration_change"
+  | "deploy_infra_change"
+  | "export_contract_change"
+  | "public_docs_contract_change"
+  | "test_evidence_weakening"
+  | "guard_validation_weakening"
+  | "safety_control_change"
+  | "concurrency_change"
+  | "opaque_tool_unbounded"
+  | "scope_slicing"
+  | "intent_effect_mismatch"
+  | "unknown_surface"
+  | "other";
+
+export interface RiskProsecutorRisk {
+  kind: RiskKind;
+  severity: "low" | "medium" | "high";
+  evidenceIds: string[];
+  explanation: string;
+  missingEvidence: string[];
+  confidence: "low" | "medium" | "high";
+}
+
+export interface RiskProsecutorUnsupportedClaim {
+  claimId: string;
+  reason: string;
+  neededEvidence: string[];
+}
+
+export interface RiskProsecutorAssessment {
+  status: "completed" | "timeout" | "error" | "skipped";
+  risks: RiskProsecutorRisk[];
+  unsupportedClaims: RiskProsecutorUnsupportedClaim[];
+  requiredChecks: string[];
+  promptInjectionSeen: boolean;
+  prosecutorFloors: ImpactFloor[];
+  prosecutorProofObligations: string[];
 }
 
 export interface ImpactCeiling {
@@ -152,6 +194,40 @@ export interface ImpactCeiling {
     | "non_executable_metadata"
     | "exact_safe_operator";
   evidenceRefs: EvidenceRef[];
+}
+
+export type EvidenceCertificateKind =
+  | "whitespace_only"
+  | "comment_only"
+  | "docs_prose_only"
+  | "blank_line_only"
+  | "ast_equivalent"
+  | "exports_unchanged"
+  | "references_bounded"
+  | "local_only";
+
+export interface EvidenceCertificate {
+  kind: EvidenceCertificateKind;
+  tierSupport: HolmesTier[];
+  subjectPaths: string[];
+  subjectSymbols: string[];
+  evidenceRefs: EvidenceRef[];
+  computedFrom: {
+    exactPatchDigest?: string;
+    exactContentDigest?: string;
+    preimageDigests: Record<string, string>;
+    postimageDigests: Record<string, string>;
+  };
+  limitations: string[];
+}
+
+export interface LexicalRiskHint {
+  id: string;
+  kind: string;
+  matchedTerms: string[];
+  source: "user_request" | "assistant_text" | "params" | "planned_summary" | "path" | "patch_payload";
+  tierSuggestion: HolmesTier;
+  quarantined: boolean;
 }
 
 export interface FailedProofObligation {
@@ -350,6 +426,7 @@ export interface ClassificationRecord {
   valid: boolean;
   invalidatedBy?: InvalidationReason;
   llmAssessment?: LlmImpactAssessment;
+  riskProsecutorAssessment?: RiskProsecutorAssessment;
   rationale: string;
 }
 
@@ -392,6 +469,16 @@ export interface HolmesToolCallLog {
   repeatedBlockCount: number;
 }
 
+export interface ScopedFloorEntry {
+  tier: HolmesTier;
+  reason: string;
+  source: "effect" | "path" | "tool" | "ledger" | "intent" | "model_params";
+  paths: string[];
+  classificationId: string;
+  objective: boolean;
+  supersededBy?: string;
+}
+
 export interface CumulativeScopeLedger {
   userRequestDigest: string;
   pathsMentioned: string[];
@@ -402,6 +489,7 @@ export interface CumulativeScopeLedger {
   toolsUsed: string[];
   priorClassifications: string[];
   priorTierFloor: HolmesTier;
+  scopedFloors: ScopedFloorEntry[];
   blockedEffects: string[];
   allowedEffects: string[];
   verificationFailures: string[];
@@ -487,6 +575,7 @@ export interface ProveDownResult {
   ceilings: ImpactCeiling[];
   missingProof: FailedProofObligation[];
   llmAssessment?: LlmImpactAssessment;
+  riskProsecutorAssessment?: RiskProsecutorAssessment;
   rationale: string;
 }
 
@@ -593,6 +682,7 @@ export interface HolmesClassifyDetails {
   scope: ScopeEnvelope;
   lease: MutationLease;
   llmAssessment?: LlmImpactAssessment;
+  riskProsecutorAssessment?: RiskProsecutorAssessment;
   rationale: string;
   nextObligation: string;
 }
@@ -602,6 +692,13 @@ export type LlmImpactAssessor = (args: {
   deterministic: ProveDownResult;
   signal: AbortSignal;
 }) => Promise<LlmImpactAssessment>;
+
+export type RiskProsecutorAssessor = (args: {
+  snapshot: ClassificationSnapshot;
+  params: HolmesClassifyParams;
+  deterministic: ProveDownResult;
+  signal: AbortSignal;
+}) => Promise<RiskProsecutorAssessment>;
 
 export interface HolmesStats {
   turnsStarted: number;
