@@ -450,11 +450,12 @@ export function buildScopeEnvelope(args: {
     args.params.target.operationKind,
     ...args.params.plannedActions.map(action => action.operationKind),
   ]);
+  const plannedActionEffectFingerprints = args.params.plannedActions.map(action => plannedActionEffectFingerprint(action));
   const effectFingerprints = unique(
-    args.params.plannedActions.map(action => plannedActionEffectFingerprint(action)).filter(Boolean),
+    plannedActionEffectFingerprints.filter((fingerprint): fingerprint is string => fingerprint !== undefined),
   );
   const finiteEnvelope = paths.length > 0 && tools.length > 0 && !paths.some(hasGlobOrDirectoryShape);
-  const exactAvailable = effectFingerprints.length > 0;
+  const exactAvailable = effectFingerprints.length > 0 && plannedActionEffectFingerprints.every(fingerprint => fingerprint !== undefined);
   const maxMutations = clampMutationCount(
     args.params.target.expectedMutationCount ?? Math.max(1, args.params.plannedActions.length),
   );
@@ -1238,7 +1239,7 @@ function buildCertificateChangeSets(params: HolmesClassifyParams, snapshot: Clas
   if (params.plannedActions.length === 0) return undefined;
   const changeSets: CertificateChangeSet[] = [];
   for (const action of params.plannedActions) {
-    const exactInput = typeof action.exactOpaqueInput === "string" ? action.exactOpaqueInput : undefined;
+    const exactInput = canonicalExactPayload(action);
     if (!exactInput) return undefined;
     const effectKind = action.structuredEffect?.kind;
     if (action.toolName === "edit" || effectKind === "edit") {
@@ -1588,7 +1589,10 @@ function provePredictableImpact(
   if (impact.downstreamBoundary === "unknown" || impact.downstreamBoundary === "cross_system") missing.push(obligation(3, "known downstream boundary", "downstream boundary is unknown or cross-system", impact.evidenceRefs));
   if (implicitContractRiskUnresolved(snapshot, params, impact)) missing.push(obligation(3, "implicit contract proof", "contract/public API risk is unresolved", impact.evidenceRefs));
   if (hasBlockingUnknowns(snapshot, params)) missing.push(obligation(3, "no blocking unknowns", "params or ledger still contain blocking unknowns", impact.evidenceRefs));
-  if (!localVerificationPlanAvailable(params)) missing.push(obligation(3, "local verification route", "no local verification route is present in classification", impact.evidenceRefs));
+  const certificates = computeEvidenceCertificates(snapshot, params);
+  const hasTierOneCert = certificates.some(certificate => certificate.tierSupport.includes(1));
+  const hasObjectiveFloorGte3 = floors.some(floor => floor.tier >= 3);
+  if (!localVerificationPlanAvailable(params) && !(hasTierOneCert && !hasObjectiveFloorGte3)) missing.push(obligation(3, "local verification route", "no local verification route is present in classification", impact.evidenceRefs));
 
   return {
     fromTier: 3,
@@ -1616,7 +1620,7 @@ function proveNullImpact(
   const certificateRefs = tierOneCertificates.flatMap(certificate => certificate.evidenceRefs);
   const hasTierOneCertificate = tierOneCertificates.length > 0;
   if (floors.some(floor => floor.tier >= 2)) missing.push(obligation(2, "no objective hard impact floor", "one or more deterministic objective floors conflict with Tier 1", floors[0]?.evidenceRefs));
-  if (!hasTierOneCertificate && (certificates.length > 0 || ceilings.length === 0)) missing.push(obligation(2, "null-impact certificate", "no deterministic null/cosmetic certificate exists", impact.evidenceRefs));
+  if (!hasTierOneCertificate) missing.push(obligation(2, "null-impact certificate", "no deterministic null/cosmetic certificate exists", impact.evidenceRefs));
   if (!concreteTier1EvidenceAvailable(params)) missing.push(obligation(2, "exact effect fingerprint", "Tier 1 requires concrete gate-matchable effect text, not parameter prose alone", impact.evidenceRefs));
   if (usesOpaqueTool(params)) missing.push(obligation(2, "non-opaque mutation tool", "opaque tools cannot receive Tier 1", impact.evidenceRefs));
   if (unknownFileType(snapshot)) missing.push(obligation(2, "known file semantics", "one or more paths have unknown semantics", impact.evidenceRefs));
@@ -2071,7 +2075,8 @@ function historyRecordTierStillApplies(ledger: CumulativeScopeLedger | undefined
     hasScopedFloor = true;
     if (!floor.supersededBy) return true;
   }
-  return !hasScopedFloor;
+  if (!hasScopedFloor) return record.lease.consumedMutations > 0;
+  return false;
 }
 
 function validateClassificationRecord(record: ClassificationRecord): void {
@@ -3132,6 +3137,16 @@ function summarizeOpaqueEffect(base: Omit<PendingToolEffect, "effectFingerprint"
   };
 }
 
+export function editEffectFingerprint(patch: string, declaredPaths: string[]): string {
+  const parsedPaths = extractEditPatchPaths(patch);
+  const paths = unique([...parsedPaths, ...declaredPaths.map(normalizeEffectPath)].filter(Boolean));
+  return `effect:edit:${paths.join(",")}:${stableHashText(normalizePatchText(patch))}`;
+}
+
+export function writeEffectFingerprint(content: string, declaredPath: string): string {
+  return `effect:write:${normalizeEffectPath(declaredPath)}:${stableHashText(content)}`;
+}
+
 function pendingEffectFingerprintForInput(
   toolName: string,
   input: Record<string, unknown>,
@@ -3139,11 +3154,11 @@ function pendingEffectFingerprintForInput(
 ): string {
   if (toolName === "edit") {
     const patch = inputString(input, ["patch", "content", "_", "input"]);
-    return `effect:edit:${effect.affectedPaths.join(",")}:${stableHashText(normalizePatchText(patch))}`;
+    return editEffectFingerprint(patch, effect.affectedPaths);
   }
   if (toolName === "write") {
     const content = inputString(input, ["content", "data"]);
-    return `effect:write:${effect.affectedPaths.join(",")}:${stableHashText(content)}`;
+    return writeEffectFingerprint(content, effect.affectedPaths[0] ?? "");
   }
   if (toolName === "ast_edit") {
     const ops = Array.isArray(input.ops) ? input.ops : [];
@@ -3681,28 +3696,53 @@ function buildExactOpaqueInputs(params: HolmesClassifyParams): Record<string, st
   return result;
 }
 
-function plannedActionEffectFingerprint(action: HolmesClassifyPlannedAction): string {
+function plannedActionEffectFingerprint(action: HolmesClassifyPlannedAction): string | undefined {
   const effect = action.structuredEffect;
   const exactOpaqueInput = typeof action.exactOpaqueInput === "string" ? action.exactOpaqueInput : undefined;
   if (effect?.kind === "edit") {
-    const patchHash = exactOpaqueInput === undefined
-      ? effect.normalizedPatchHash
-      : stableHashText(normalizePatchText(exactOpaqueInput));
-    return `effect:edit:${plannedSingleEffectPathSegment(action, effect.path)}:${patchHash}`;
+    // Prefer structuredEffect.exactPatch, then exactOpaqueInput, then legacy normalizedPatchHash
+    const exactPatch = stringField((effect as { exactPatch?: unknown }).exactPatch);
+    const canonicalPatch = exactPatch ?? exactOpaqueInput;
+    if (canonicalPatch !== undefined) return editEffectFingerprint(canonicalPatch, actionDeclaredPaths(action));
+    const normalizedPatchHash = stringField((effect as { normalizedPatchHash?: unknown }).normalizedPatchHash);
+    return normalizedPatchHash === undefined ? undefined : `effect:edit:${plannedSingleEffectPathSegment(action, effect.path)}:${normalizedPatchHash}`;
   }
   if (effect?.kind === "write") {
-    const contentHash = exactOpaqueInput === undefined
-      ? effect.contentHash
-      : stableHashText(exactOpaqueInput);
-    return `effect:write:${plannedSingleEffectPathSegment(action, effect.path)}:${contentHash}`;
+    // Prefer structuredEffect.exactContent, then exactOpaqueInput, then legacy contentHash
+    const exactContent = stringField((effect as { exactContent?: unknown }).exactContent);
+    const canonicalContent = exactContent ?? exactOpaqueInput;
+    if (canonicalContent !== undefined) return writeEffectFingerprint(canonicalContent, (actionDeclaredPaths(action))[0] ?? "");
+    const contentHash = stringField((effect as { contentHash?: unknown }).contentHash);
+    return contentHash === undefined ? undefined : `effect:write:${plannedSingleEffectPathSegment(action, effect.path)}:${contentHash}`;
   }
-  if (effect?.kind === "ast_edit") return `effect:ast_edit:${effect.paths.map(normalizeEffectPath).sort().join(",")}:${effect.patternHash}:${effect.replacementHash}:${effect.expectedMatchCount ?? ""}`;
+  if (effect?.kind === "ast_edit") {
+    const exactOps = (effect as { exactOps?: unknown }).exactOps;
+    if (typeof exactOps === "string") {
+      try {
+        const parsed = JSON.parse(exactOps);
+        if (Array.isArray(parsed)) {
+          const patternHash = stableHashJson(parsed.map(op => asRecord(op).pat ?? asRecord(op).pattern ?? ""));
+          const replacementHash = stableHashJson(parsed.map(op => asRecord(op).out ?? asRecord(op).replacement ?? ""));
+          return `effect:ast_edit:${effect.paths.map(normalizeEffectPath).sort().join(",")}:${patternHash}:${replacementHash}:${parsed.length || ""}`;
+        }
+      } catch {}
+    }
+    if (Array.isArray(exactOps)) {
+      const patternHash = stableHashJson(exactOps.map(op => asRecord(op).pat ?? asRecord(op).pattern ?? ""));
+      const replacementHash = stableHashJson(exactOps.map(op => asRecord(op).out ?? asRecord(op).replacement ?? ""));
+      return `effect:ast_edit:${effect.paths.map(normalizeEffectPath).sort().join(",")}:${patternHash}:${replacementHash}:${exactOps.length || ""}`;
+    }
+    const patternHash = stringField((effect as { patternHash?: unknown }).patternHash);
+    const replacementHash = stringField((effect as { replacementHash?: unknown }).replacementHash);
+    if (patternHash === undefined || replacementHash === undefined) return undefined;
+    return `effect:ast_edit:${effect.paths.map(normalizeEffectPath).sort().join(",")}:${patternHash}:${replacementHash}:${effect.expectedMatchCount ?? ""}`;
+  }
   if (exactOpaqueInput !== undefined) {
-    if (action.toolName === "edit") return `effect:edit:${plannedSingleEffectPathSegment(action)}:${stableHashText(normalizePatchText(exactOpaqueInput))}`;
-    if (action.toolName === "write") return `effect:write:${plannedSingleEffectPathSegment(action)}:${stableHashText(exactOpaqueInput)}`;
+    if (action.toolName === "edit") return editEffectFingerprint(exactOpaqueInput, actionDeclaredPaths(action));
+    if (action.toolName === "write") return writeEffectFingerprint(exactOpaqueInput, (actionDeclaredPaths(action))[0] ?? "");
     return `opaque:${action.toolName}:${canonicalOpaqueClaimDigest(action.toolName, exactOpaqueInput)}`;
   }
-  return stableHashJson({ toolName: action.toolName, paths: action.paths.map(normalizeEffectPath), operationKind: action.operationKind, summary: action.summary });
+  return undefined;
 }
 
 function plannedSingleEffectPathSegment(action: HolmesClassifyPlannedAction, structuredPath?: string): string {
@@ -3816,12 +3856,29 @@ function exactEffectAvailableFromParams(params: HolmesClassifyParams): boolean {
 }
 
 function concreteTier1EvidenceAvailable(params: HolmesClassifyParams): boolean {
-  return concreteTier1Effect(params).raw.length > 0 && params.plannedActions.every(action => Boolean(action.structuredEffect || action.exactOpaqueInput));
+  return concreteTier1Effect(params).raw.length > 0 && params.plannedActions.every(action => canonicalExactPayload(action) !== undefined || Boolean(action.structuredEffect || action.exactOpaqueInput));
+}
+
+function canonicalExactPayload(action: HolmesClassifyPlannedAction): string | undefined {
+  const effect = action.structuredEffect;
+  if (effect?.kind === "edit") {
+    const exactPatch = (effect as { exactPatch?: unknown }).exactPatch;
+    if (typeof exactPatch === "string") return exactPatch;
+  }
+  if (effect?.kind === "write") {
+    const exactContent = (effect as { exactContent?: unknown }).exactContent;
+    if (typeof exactContent === "string") return exactContent;
+  }
+  if (effect?.kind === "ast_edit") {
+    const exactOps = (effect as { exactOps?: unknown }).exactOps;
+    if (typeof exactOps === "string") return exactOps;
+  }
+  return typeof action.exactOpaqueInput === "string" ? action.exactOpaqueInput : undefined;
 }
 
 function concreteTier1Effect(params: HolmesClassifyParams): { raw: string; changedLines: string[] } {
   const raw = params.plannedActions
-    .map(action => action.exactOpaqueInput ?? "")
+    .map(action => canonicalExactPayload(action) ?? "")
     .filter(Boolean)
     .join("\n");
   return { raw, changedLines: extractChangedPayloadLines(raw) };
@@ -3905,7 +3962,25 @@ function unknownFileType(snapshot: ClassificationSnapshot): boolean {
 }
 
 function changesContractualDocs(snapshot: ClassificationSnapshot, params: HolmesClassifyParams): boolean {
-  if (!snapshot.pathsFromParams.some(path => DOC_PATH.test(path))) return false;
+  const docPaths = snapshot.pathsFromParams.filter(path => DOC_PATH.test(path));
+  if (docPaths.length === 0) return false;
+
+  const certificates = computeEvidenceCertificates(snapshot, params);
+  const nonContractDocCertificates = certificates.filter(certificate =>
+    certificate.kind === "blank_line_only" || certificate.kind === "docs_prose_only",
+  );
+  if (docPaths.every(path => certificateCoversPath(nonContractDocCertificates, path, 1))) return false;
+
+  const changeSets = buildCertificateChangeSets(params, snapshot);
+  if (changeSets) {
+    const changedDocLines = changeSets.flatMap(changeSet =>
+      changeSet.changedRanges.flatMap(range =>
+        DOC_PATH.test(range.path) ? [...range.oldLines, ...range.newLines] : [],
+      ),
+    );
+    return changedDocLines.some(line => CONTRACT_DOC_WORDS.test(line));
+  }
+
   return CONTRACT_DOC_WORDS.test(lowerEvidenceText(snapshot, params, {
     requestedObject: [], requestedOperation: [], requestedEffect: "", constraints: [], nonGoals: [], ambiguity: "clear",
   }));

@@ -1207,6 +1207,58 @@ describe("HOLMES prove-down algorithm", () => {
 
     expect(result.finalTier).toBeGreaterThanOrEqual(3);
   });
+
+  test("blank-line README edit reaches Tier 1 with exactPatch certificate (regression: Test 3 death spiral)", async () => {
+    const blankLinePatch = [
+      "¶README.md#ABCD",
+      "insert tail:",
+      "+",
+    ].join("\n");
+    const result = await classify(
+      {
+        proposedTier: 1,
+        target: { summary: "Add trailing blank line", files: ["README.md"], tools: ["edit"], operationKind: "mechanical_text", expectedMutationCount: 1 },
+        plannedActions: [{
+          toolName: "edit",
+          paths: ["README.md"],
+          operationKind: "mechanical_text" as OperationKind,
+          summary: "Append blank line to README.md",
+          structuredEffect: { kind: "edit" as const, path: "README.md", exactPatch: blankLinePatch, semanticClassClaim: "blank line only" } as any,
+        }],
+      },
+      {
+        pathsFromParams: ["README.md"],
+        fileSnapshots: [{ path: "README.md", digest: hash("readme-blank"), bytesRead: 80, truncated: false, fileRole: "docs", excerpt: "# My Project\n\nSome docs." }],
+      },
+    );
+
+    expect(result.finalTier).toBe(1);
+    expect(result.lease.leaseKind).toBe("exact");
+    expect(result.lease.paths).toContain("README.md");
+  });
+
+  test("blank-line README without exactPatch gets scope lease, not phantom exact lease (regression: B3)", async () => {
+    const result = await classify(
+      {
+        proposedTier: 1,
+        target: { summary: "Add trailing blank line", files: ["README.md"], tools: ["edit"], operationKind: "mechanical_text", expectedMutationCount: 1 },
+        plannedActions: [{
+          toolName: "edit",
+          paths: ["README.md"],
+          operationKind: "mechanical_text" as OperationKind,
+          summary: "Append blank line to README.md",
+        }],
+      },
+      {
+        pathsFromParams: ["README.md"],
+        fileSnapshots: [{ path: "README.md", digest: hash("readme-blank"), bytesRead: 80, truncated: false, fileRole: "docs", excerpt: "# My Project\n\nSome docs." }],
+      },
+    );
+
+    // Without exact payload, cannot prove Tier 1 — should be Tier 2+ and not an exact lease
+    expect(result.finalTier).toBeGreaterThanOrEqual(2);
+    expect(result.lease.leaseKind).not.toBe("exact");
+  });
 });
 
 describe("HOLMES impact signal detection", () => {
@@ -1771,7 +1823,7 @@ describe("HOLMES adversarial scenarios", () => {
     const auth = editCall(AUTH_PATCH);
     installRecord(state, recordForEvent(auth, { tier: 4, paths: ["src/auth/session.ts"], process: { status: "tier4_looping", closureSatisfied: false } }));
     installRecord(state, recordForEvent(auth, { tier: 1, classificationId: "class-shopping-low", paths: ["src/auth/session.ts"], process: { status: "mutation_ready", closureSatisfied: true } }));
-    state.ledgerByRequest.set(REQUEST_DIGEST, baseLedger({ priorTierFloor: 4, pathsMentioned: ["src/auth/session.ts"], priorClassifications: state.history.map((record) => record.classificationId) }) as any);
+    state.ledgerByRequest.set(REQUEST_DIGEST, baseLedger({ priorTierFloor: 4, pathsMentioned: ["src/auth/session.ts"], priorClassifications: state.history.map((record) => record.classificationId), scopedFloors: [{ tier: 4 as const, reason: "auth guardrail path", source: "path" as const, paths: ["src/auth/session.ts"], classificationId: state.history[0].classificationId, objective: true }] }) as any);
 
     const result = handleClassificationGate(gateArgs(auth, state, observeVisible("[CLASSIFY: Tier 1] looks safe")) as any);
 

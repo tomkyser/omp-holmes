@@ -582,22 +582,21 @@ export interface ProveDownResult {
 export interface HolmesClassifyStructuredEditEffect {
   kind: "edit";
   path: string;
-  normalizedPatchHash: string;
-  semanticClassClaim: string;
+  exactPatch: string;
+  semanticClassClaim?: string;
 }
 
 export interface HolmesClassifyStructuredWriteEffect {
   kind: "write";
   path: string;
-  contentHash: string;
-  replacementClassClaim: string;
+  exactContent: string;
+  replacementClassClaim?: string;
 }
 
 export interface HolmesClassifyStructuredAstEditEffect {
   kind: "ast_edit";
   paths: string[];
-  patternHash: string;
-  replacementHash: string;
+  exactOps: string;
   expectedMatchCount?: number;
 }
 
@@ -803,8 +802,8 @@ export function buildHolmesClassifyParamsSchema(Type: ExtensionAPI["typebox"]["T
       {
         kind: Type.Literal("edit"),
         path: Type.String({ minLength: 1, maxLength: 500 }),
-        normalizedPatchHash: Type.String({ minLength: 1, maxLength: 256 }),
-        semanticClassClaim: Type.String({ maxLength: 200 }),
+        exactPatch: Type.String({ maxLength: 32_000 }),
+        semanticClassClaim: Type.Optional(Type.String({ maxLength: 200 })),
       },
       { additionalProperties: false },
     ),
@@ -812,8 +811,8 @@ export function buildHolmesClassifyParamsSchema(Type: ExtensionAPI["typebox"]["T
       {
         kind: Type.Literal("write"),
         path: Type.String({ minLength: 1, maxLength: 500 }),
-        contentHash: Type.String({ minLength: 1, maxLength: 256 }),
-        replacementClassClaim: Type.String({ maxLength: 200 }),
+        exactContent: Type.String({ maxLength: 64_000 }),
+        replacementClassClaim: Type.Optional(Type.String({ maxLength: 200 })),
       },
       { additionalProperties: false },
     ),
@@ -821,8 +820,7 @@ export function buildHolmesClassifyParamsSchema(Type: ExtensionAPI["typebox"]["T
       {
         kind: Type.Literal("ast_edit"),
         paths: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 64 }),
-        patternHash: Type.String({ minLength: 1, maxLength: 256 }),
-        replacementHash: Type.String({ minLength: 1, maxLength: 256 }),
+        exactOps: Type.String({ maxLength: 32_000 }),
         expectedMatchCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
       },
       { additionalProperties: false },
