@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "A plugin that implements the HOLMES cognitive redirect and reasoning enforcement framework.",
   "scripts": {
-    "test": "bun test src/main.test.ts",
+    "test": "bun test src/",
     "check": "tsc --noEmit"
   },
   "devDependencies": {

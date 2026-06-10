@@ -10,6 +10,8 @@ import {
   MAX_CLASSIFIER_FILE_BYTES,
   MAX_CLASSIFIER_FILES,
   MAX_CLASSIFIER_TOTAL_BYTES,
+  MAX_GRADER_CALLS_PER_REQUEST,
+  MAX_GRADER_HOLLOW_FLAGS,
   MAX_SCAN_CHARS,
   READ_ONLY_TOOLS,
   SESSION_TOOLS,
@@ -30,6 +32,7 @@ import type {
   HolmesClassifyDetails,
   HolmesClassifyParams,
   HolmesClassifyPlannedAction,
+  HolmesConfig,
   HolmesStats,
   HolmesTier,
   HolmesToolCallLog,
@@ -52,6 +55,7 @@ import type {
   OperationClass,
   PendingToolEffect,
   ProveDownResult,
+  ReasoningGraderAssessment,
   RiskKind,
   RiskProsecutorAssessment,
   RiskProsecutorAssessor,
@@ -60,6 +64,12 @@ import type {
   ToolCallSummary,
   VerificationFailureEntry,
 } from "./types";
+import type { ReasoningGraderAssessor } from "./grader";
+import {
+  buildReasoningGraderPacket,
+  graderCacheKey,
+  mapGraderOutcomeToObligations,
+} from "./grader";
 import { redactSelfClassification } from "./observation";
 
 type RegisteredTool = Parameters<ExtensionAPI["registerTool"]>[0];
@@ -3515,6 +3525,10 @@ function requirementsSatisfied(args: {
     if (!hasVerification) missing.push("verification plan");
   }
 
+  const graderObligations = args.record.process.graderObligations ?? [];
+  if (graderObligations.length > 0) {
+    missing.push(...graderObligations);
+  }
   return missing.length === 0 ? { ok: true } : { ok: false, missing: unique(missing) };
 }
 
@@ -4387,20 +4401,30 @@ export function resetRequestLedger(state: HolmesClassificationState, userRequest
   state.ledgerByRequest.set(userRequestDigest, emptyLedger(userRequestDigest));
 }
 
-export function updateClassificationComplianceFromObservation(args: {
+export async function updateClassificationComplianceFromObservation(args: {
   classification: HolmesClassificationState;
   observation: MessageObservationState;
   sequence: number;
   delegation: DelegationState;
   toolLog: HolmesToolCallLog;
-}): void {
+  config?: HolmesConfig;
+  stats?: HolmesStats;
+  grader?: ReasoningGraderAssessor;
+  graderCache?: Map<string, ReasoningGraderAssessment>;
+  graderCallsByRequestDigest?: Map<string, number>;
+}): Promise<void> {
   const visible = args.observation.visibleText;
   const evidenceRefs = extractEvidenceIds(visible);
   const hasVerification = localVerificationPlanAvailableFromText(visible);
+  let graderCallsThisInvocation = 0;
+  let localGraderCache: Map<string, ReasoningGraderAssessment> | undefined;
+
   for (const record of args.classification.history) {
     if (!record.valid) continue;
     if (record.userRequestDigest !== args.classification.latestUserRequestDigest) continue;
     if (args.sequence <= record.createdAtSequence) continue;
+
+    let graderLevel: "tier3_pass" | "tier4_pass" | undefined;
     if (record.tier === 2 && /\bTARGET\s*:/i.test(visible) && /\bDELTA\s*:/i.test(visible) && hasVerification) {
       record.process.status = "mutation_ready";
       record.process.closureSatisfied = true;
@@ -4411,6 +4435,7 @@ export function updateClassificationComplianceFromObservation(args: {
         record.process.status = "mutation_ready";
         record.process.passCountAfterClassification = Math.max(record.process.passCountAfterClassification, 1);
         record.process.closureSatisfied = true;
+        graderLevel = "tier3_pass";
       }
     } else if (record.tier === 4 && hasHolmesSections(visible) && evidenceRefs.length > 0 && hasVerification && requiredDelegationSatisfied(record, args.delegation)) {
       markUnknownsResolved(record, evidenceRefs);
@@ -4425,8 +4450,88 @@ export function updateClassificationComplianceFromObservation(args: {
         record.process.status = "mutation_ready";
         record.process.passCountAfterClassification = Math.max(record.process.passCountAfterClassification, 1);
         record.process.closureSatisfied = true;
+        graderLevel = "tier4_pass";
       }
     }
+
+    if (graderLevel === undefined) continue;
+    if (args.config?.gradeMutationPasses !== true || !args.grader) continue;
+
+    const pendingGraderObligations = record.process.graderObligations ?? [];
+    if (record.process.grader && pendingGraderObligations.length === 0) continue;
+
+    const ledger = args.classification.ledgerByRequest.get(record.userRequestDigest);
+    const hardFloor = maxTier(maxTierFromFloors(record.impact.floors), maxActiveScopedFloorForPaths(ledger, record.scope.paths));
+    if (hardFloor > record.tier) continue;
+
+    const { packet } = buildReasoningGraderPacket({
+      level: graderLevel,
+      observation: args.observation,
+      toolLog: args.toolLog,
+      lease: record.lease,
+    });
+    const cacheKey = `${record.userRequestDigest}\0${graderCacheKey(packet)}`;
+    const cache = args.graderCache ?? (localGraderCache ??= new Map<string, ReasoningGraderAssessment>());
+    const cachedAssessment = cache.get(cacheKey);
+    const cached = cachedAssessment !== undefined;
+    let assessment: ReasoningGraderAssessment;
+
+    if (cachedAssessment) {
+      assessment = cachedAssessment;
+      if (args.stats) args.stats.graderCacheHits++;
+    } else {
+      const callsUsed = args.graderCallsByRequestDigest?.get(record.userRequestDigest) ?? graderCallsThisInvocation;
+      if (callsUsed >= MAX_GRADER_CALLS_PER_REQUEST) continue;
+      if (args.graderCallsByRequestDigest) {
+        args.graderCallsByRequestDigest.set(record.userRequestDigest, callsUsed + 1);
+      } else {
+        graderCallsThisInvocation++;
+      }
+      if (args.stats) args.stats.graderCalls++;
+      try {
+        assessment = await args.grader(packet);
+      } catch {
+        continue;
+      }
+      cache.set(cacheKey, assessment);
+    }
+
+    if (assessment.status !== "succeeded") continue;
+
+    const mapped = mapGraderOutcomeToObligations(assessment, record);
+    const obligationAxes = unique(mapped.obligations);
+    const defectAxes = unique([
+      ...obligationAxes,
+      ...assessment.defects
+        .filter((defect) => defect.severity === "high" || defect.severity === "medium")
+        .map((defect) => defect.axis),
+    ]);
+    record.process.grader = {
+      ...(assessment.verdict ? { verdict: assessment.verdict } : {}),
+      defectAxes,
+      cached,
+    };
+
+    if (assessment.verdict === "coherent") {
+      if (pendingGraderObligations.length > 0) record.process.graderObligations = [];
+      continue;
+    }
+
+    const hollowFlags = record.process.graderHollowFlags ?? 0;
+    const hollowVerdict = assessment.verdict === "hollow" || assessment.verdict === "incoherent";
+    if (hollowVerdict && hollowFlags >= MAX_GRADER_HOLLOW_FLAGS) {
+      if (pendingGraderObligations.length > 0) {
+        record.process.graderObligations = [];
+        if (args.stats) args.stats.reasoningSoftViolations++;
+      }
+      continue;
+    }
+
+    if (obligationAxes.length === 0) continue;
+
+    record.process.graderHollowFlags = hollowFlags + 1;
+    if (args.stats) args.stats.graderHollowFlags++;
+    record.process.graderObligations = unique([...pendingGraderObligations, ...obligationAxes]);
   }
 }
 

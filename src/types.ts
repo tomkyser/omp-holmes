@@ -1,4 +1,5 @@
 export const HOLMES_CLASSIFY_TOOL = "holmes_classify" as const;
+export const HOLMES_CHECKPOINT_TOOL = "holmes_checkpoint";
 export const HOLMES_RULE_VERSION = "holmes-classify-v1" as const;
 
 export type HolmesTier = 1 | 2 | 3 | 4;
@@ -110,6 +111,103 @@ export interface MessageObservationState {
   thinkingText: string;
   visibleEvidence?: HolmesEvidence;
   thinkingEvidence?: HolmesEvidence;
+}
+
+/** Answer-side obligation level (plan §3.2). */
+export type AnswerObligationLevel = "none" | "light" | "full";
+
+/** Answer gate state-machine phase (plan §3.5). */
+export type AnswerGatePhase = "idle" | "obligated" | "awaiting_repair" | "satisfied" | "soft_accept";
+
+/** Deterministic answer triage signals (plan §3.2). */
+export interface AnswerTriageSignals {
+  requestText: string;
+  requestChars: number;
+  questionCount: number;
+  hasCodeFence: boolean;
+  reasoningVerbHits: number;
+  multiPartMarkers: number;
+}
+
+/** Deterministic answer escalation facts (plan §3.2). */
+export interface AnswerEscalationFacts {
+  toolCallsThisRequest: number;
+  effectfulToolCalls: number;
+  finalVisibleChars: number;
+  codeBlocksInAnswer: number;
+  liveTier34Record: boolean;
+}
+
+/** Answer gate state (plan §3.5). */
+export interface AnswerGateState {
+  phase: AnswerGatePhase;
+  level: AnswerObligationLevel;
+  requestDigest: string;
+  createdAtSequence: number;
+  retriesUsed: number;
+  graderHollowFlags: number;
+  checkpointRecords: AnswerCheckpointRecord[];
+}
+
+/** Answer checkpoint record (plan §3.4). */
+export interface AnswerCheckpointRecord {
+  id: string;
+  requestDigest: string;
+  createdAtSequence: number;
+  level: AnswerObligationLevel;
+  source: "visible_pass" | "checkpoint_tool";
+  shapeOk: boolean;
+  verifiedEvidenceIds: string[];
+  unverifiedMentions: string[];
+  grader?: ReasoningGraderOutcome;
+}
+
+/** Holmes checkpoint payload (plan §3.4). */
+export interface HolmesCheckpointParams {
+  target: string;
+  chain: Array<{ step: string; evidence?: string[] }>;
+  unknowns: Array<{ question: string; status: "open" | "closed"; closedBy?: string }>;
+  plan: string[];
+}
+
+/** Reasoning grader packet (plan §4.3). */
+export interface ReasoningGraderPacket {
+  facts: {
+    level: AnswerObligationLevel | "tier3_pass" | "tier4_pass";
+    verifiedEvidenceIds: string[];
+    unverifiedMentions: string[];
+    sectionPresence: Record<string, boolean>;
+    toolCallSummary: Array<{ tool: string; pathish: string[] }>;
+    leasePaths?: string[];
+  };
+  untrustedClaims: {
+    userRequestExcerpt: string;
+    passText: string;
+    checkpointParams?: HolmesCheckpointParams;
+  };
+}
+
+/** Reasoning grader defect (plan §4.4). */
+export interface GraderDefect {
+  axis: "chain" | "closure" | "plan";
+  severity: "high" | "medium" | "low";
+  detail: string;
+  citedEvidence: string[];
+}
+
+/** Reasoning grader assessment (plan §4.4). */
+export interface ReasoningGraderAssessment {
+  status: "succeeded" | "failed" | "skipped";
+  verdict?: "coherent" | "hollow" | "incoherent";
+  defects: GraderDefect[];
+  requiredAdditions: string[];
+}
+
+/** Reasoning grader outcome cache result (plan §7). */
+export interface ReasoningGraderOutcome {
+  verdict?: "coherent" | "hollow" | "incoherent";
+  defectAxes: string[];
+  cached: boolean;
 }
 
 export type ImpactSignalKind =
@@ -375,6 +473,9 @@ export interface ClassificationProcessState {
   passCountAfterClassification: number;
   closureSatisfied: boolean;
   requiredEvidence: string[];
+  graderObligations?: string[];
+  graderHollowFlags?: number;
+  grader?: ReasoningGraderOutcome;
 }
 
 export type ProcessState = ClassificationProcessState;
@@ -515,6 +616,13 @@ export interface HolmesTurnMetadata {
   latestUserRequestDigest: string;
   startedAtMs: number;
   isPrintMode?: boolean;
+}
+
+/** Extension configuration options (plan §7). */
+export interface HolmesConfig {
+  /** Grade mutation passes with the reasoning grader; default false. */
+  gradeMutationPasses?: boolean;
+  graderTimeoutMs?: number;
 }
 
 export interface ClassificationGateState {
@@ -692,7 +800,6 @@ export type RiskProsecutorAssessor = (args: {
   deterministic: ProveDownResult;
   signal: AbortSignal;
 }) => Promise<RiskProsecutorAssessment>;
-
 export interface HolmesStats {
   turnsStarted: number;
   toolCallsIntercepted: number;
@@ -701,6 +808,13 @@ export interface HolmesStats {
   systemPromptAppends: number;
   visibleMarkersObserved: number;
   reasoningSoftViolations: number;
+  answerObligationsCreated: number;
+  answerCheckpointsSatisfied: number;
+  answerDemandsIssued: number;
+  answerSoftAccepts: number;
+  graderCalls: number;
+  graderCacheHits: number;
+  graderHollowFlags: number;
   delegationTaskCalls: number;
   delegationBlockedCalls: number;
   classificationsCreated: number;
@@ -715,6 +829,7 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "ast_grep",
   "web_search",
   HOLMES_CLASSIFY_TOOL,
+  HOLMES_CHECKPOINT_TOOL,
 ]);
 
 export const SESSION_TOOLS: ReadonlySet<string> = new Set([
@@ -751,6 +866,7 @@ export const EXEMPT_READ_AFTER: ReadonlySet<string> = new Set([
   "ast_edit",
   "task",
   HOLMES_CLASSIFY_TOOL,
+  HOLMES_CHECKPOINT_TOOL,
 ]);
 export const TASK_TOOL_NAME = "task";
 export const DEAD_HOLMES_AGENTS: ReadonlySet<string> = new Set([
@@ -759,6 +875,15 @@ export const DEAD_HOLMES_AGENTS: ReadonlySet<string> = new Set([
 ]);
 
 export const MAX_PRIMITIVE_BURST = 3;
+export const MAX_ANSWER_RETRIES = 1;
+export const MAX_GRADER_HOLLOW_FLAGS = 1;
+export const MAX_GRADER_CALLS_PER_REQUEST = 2;
+export const DEFAULT_GRADER_TIMEOUT_MS = 5_000;
+export const ANSWER_TRIVIAL_REQUEST_CHARS = 200;
+export const ANSWER_SUBSTANTIVE_CHARS = 600;
+export const ANSWER_HEAVY_CHARS = 3_000;
+export const ANSWER_TOOLCALL_LIGHT = 4;
+export const ANSWER_TOOLCALL_FULL = 8;
 export const MAX_SCAN_CHARS = 16_000;
 export const MAX_CLASSIFIER_FILES = 8;
 export const MAX_CLASSIFIER_FILE_BYTES = 24 * 1024;
@@ -837,6 +962,13 @@ export function createStats(): HolmesStats {
     systemPromptAppends: 0,
     visibleMarkersObserved: 0,
     reasoningSoftViolations: 0,
+    answerObligationsCreated: 0,
+    answerCheckpointsSatisfied: 0,
+    answerDemandsIssued: 0,
+    answerSoftAccepts: 0,
+    graderCalls: 0,
+    graderCacheHits: 0,
+    graderHollowFlags: 0,
     delegationTaskCalls: 0,
     delegationBlockedCalls: 0,
     classificationsCreated: 0,

@@ -20,6 +20,7 @@ import {
   stableHashJson,
   stableHashText,
   summarizePendingEffect,
+  updateClassificationComplianceFromObservation,
   updateVerificationOutcome,
 } from "./classification";
 import {
@@ -65,6 +66,8 @@ import {
   type PrimitiveBurstState,
   type ProveDownResult,
 } from "./types";
+
+import type { ReasoningGraderAssessor } from "./grader";
 
 type ToolCall = { type: "tool_call"; toolCallId: string; toolName: string; input: Record<string, unknown> };
 type EventHandler = (event: any, ctx: any) => any;
@@ -2714,5 +2717,462 @@ describe("HOLMES schema ownership", () => {
     expect(registered).toBeDefined();
     expect(registered.parameters?.kind).toBe("object");
     expect(Object.keys(registered.parameters?.properties ?? {})).toContain("plannedActions");
+  });
+});
+
+describe("HOLMES mutation-path reasoning grading flag", () => {
+  const tier3PassText = [
+    "Hone: target is README.md only.",
+    "Observe: current README.md was inspected at ¶README.md#ABCD.",
+    "Ladder: bounded single-file prose edit; no blocking unknowns remain.",
+    "Map: scope remains README.md using edit only.",
+    "Establish: verify by read-back of README.md.",
+    "Synthesize: edit README.md only and verify by read-back.",
+  ].join("\n");
+
+  const tier4PassText = (evidenceId = "ABCD") => [
+    "Hone: target is README.md only.",
+    `Observe: current README.md was inspected at ¶README.md#${evidenceId}.`,
+    "Ladder: Tier 4 closure is now a fixed-point; all blocking unknowns closed.",
+    "Map: cumulative scope remains README.md using edit only.",
+    "Establish: verify by read-back of README.md.",
+    "Synthesize: fixed-point closure reached; all blocking unknowns closed; scope remains README.md under the approved edit lease; blocked-effect ledger reviewed; verification plan is README.md read-back.",
+  ].join("\n");
+
+  async function gateAfterCompliance(args: {
+    tier: HolmesTier;
+    observation: MessageObservationState;
+    grader?: ReasoningGraderAssessor;
+    gradeMutationPasses?: boolean;
+    stats?: ReturnType<typeof createStats>;
+    graderCache?: Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>;
+    graderCallsByRequestDigest?: Map<string, number>;
+  }): Promise<{ result: ReturnType<typeof handleClassificationGate>; record: ClassificationRecord }> {
+    const state = createMockClassificationState({ sequence: 2 });
+    const event = editCall();
+    const record = installRecord(state, recordForEvent(event, { tier: args.tier }));
+    const toolLog = createToolLog();
+    const updateArgs: Parameters<typeof updateClassificationComplianceFromObservation>[0] = {
+      classification: state,
+      observation: args.observation,
+      sequence: 2,
+      delegation: createDelegationState(),
+      toolLog,
+    };
+    if (args.gradeMutationPasses !== undefined) updateArgs.config = { gradeMutationPasses: args.gradeMutationPasses };
+    if (args.stats) updateArgs.stats = args.stats;
+    if (args.grader) updateArgs.grader = args.grader;
+    if (args.graderCache) updateArgs.graderCache = args.graderCache;
+    if (args.graderCallsByRequestDigest) updateArgs.graderCallsByRequestDigest = args.graderCallsByRequestDigest;
+    await updateClassificationComplianceFromObservation(updateArgs);
+    return {
+      result: handleClassificationGate({ ...gateArgs(event, state, args.observation, toolLog), event }),
+      record,
+    };
+  }
+
+  test("gradeMutationPasses absent is behaviorally inert for representative gate outcomes", async () => {
+    let graderCalls = 0;
+    const leakingGrader: ReasoningGraderAssessor = async (packet) => {
+      graderCalls++;
+      return {
+        status: "succeeded",
+        verdict: "hollow",
+        defects: [{
+          axis: "chain",
+          severity: "high",
+          detail: "chain is hollow",
+          citedEvidence: [packet.facts.verifiedEvidenceIds[0] ?? "missing-evidence"],
+        }],
+        requiredAdditions: ["chain"],
+      };
+    };
+    const cases = [
+      { tier: 2 as HolmesTier, observation: observeVisible("TARGET: README.md typo\nDELTA: edit README.md only\nNEXT: verify by read-back.") },
+      { tier: 3 as HolmesTier, observation: observeVisible(tier3PassText) },
+      { tier: 4 as HolmesTier, observation: observeVisible(tier4PassText()) },
+    ];
+
+    for (const item of cases) {
+      const baseline = await gateAfterCompliance(item);
+      const withFlagAbsent = await gateAfterCompliance({
+        ...item,
+        grader: leakingGrader,
+        stats: createStats(),
+        graderCache: new Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>(),
+        graderCallsByRequestDigest: new Map<string, number>(),
+      });
+      expect(withFlagAbsent.result?.block === true).toBe(baseline.result?.block === true);
+    }
+    expect(graderCalls).toBe(0);
+  });
+
+  test("failed mutation-path grader is inert for Tier 4 requirements", async () => {
+    const observation = observeVisible(tier4PassText());
+    const baseline = await gateAfterCompliance({ tier: 4, observation });
+    const stats = createStats();
+    const failedGrader: ReasoningGraderAssessor = async () => ({
+      status: "failed",
+      defects: [],
+      requiredAdditions: [],
+    });
+
+    const graded = await gateAfterCompliance({
+      tier: 4,
+      observation,
+      gradeMutationPasses: true,
+      grader: failedGrader,
+      stats,
+      graderCache: new Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>(),
+      graderCallsByRequestDigest: new Map<string, number>(),
+    });
+
+    expect(graded.result).toEqual(baseline.result);
+    expect(graded.record.process.graderObligations ?? []).toEqual([]);
+    expect(stats.graderCalls).toBe(1);
+  });
+
+  test("valid-citation hollow grader defect raises one axis then cap-converts to advisory", async () => {
+    const state = createMockClassificationState({ sequence: 2 });
+    const event = editCall();
+    const record = installRecord(state, recordForEvent(event, { tier: 4 }));
+    const stats = createStats();
+    const graderCache = new Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>();
+    const graderCallsByRequestDigest = new Map<string, number>();
+    const hollowGrader: ReasoningGraderAssessor = async (packet) => ({
+      status: "succeeded",
+      verdict: "hollow",
+      defects: [{
+        axis: "chain",
+        severity: "high",
+        detail: "chain is hollow",
+        citedEvidence: [packet.facts.verifiedEvidenceIds[0] ?? "missing-evidence"],
+      }],
+      requiredAdditions: ["chain"],
+    });
+
+    const firstObservation = observeVisible(tier4PassText("ABCD"));
+    const toolLog = createToolLog();
+    await updateClassificationComplianceFromObservation({
+      classification: state,
+      observation: firstObservation,
+      sequence: 2,
+      delegation: createDelegationState(),
+      toolLog,
+      config: { gradeMutationPasses: true },
+      stats,
+      grader: hollowGrader,
+      graderCache,
+      graderCallsByRequestDigest,
+    });
+
+    expect(record.process.graderObligations).toEqual(["chain"]);
+    expect(stats.graderHollowFlags).toBe(1);
+    const blocked = handleClassificationGate({ ...gateArgs(event, state, firstObservation, toolLog), event });
+    expect(blocked?.block).toBe(true);
+    expect(blocked?.reason).toMatch(/chain/);
+
+    const secondObservation = observeVisible(tier4PassText("DCBA"));
+    await updateClassificationComplianceFromObservation({
+      classification: state,
+      observation: secondObservation,
+      sequence: 3,
+      delegation: createDelegationState(),
+      toolLog,
+      config: { gradeMutationPasses: true },
+      stats,
+      grader: hollowGrader,
+      graderCache,
+      graderCallsByRequestDigest,
+    });
+
+    expect(record.process.graderObligations).toEqual([]);
+    expect(stats.reasoningSoftViolations).toBe(1);
+    expect(graderCallsByRequestDigest.get(REQUEST_DIGEST)).toBe(2);
+    expect(handleClassificationGate({ ...gateArgs(event, state, secondObservation, toolLog), event })).toBeUndefined();
+  });
+});
+
+describe("HOLMES answer gate integration", () => {
+  const fullRequest = (label: string) => `Please debug and design the read-only answer strategy for this migration (${label}).`;
+  const substantiveNoPassAnswer = [
+    "The safe answer is to preserve the current behavior and explain the trade-offs from the inspected evidence.",
+    "The recommendation is conservative: keep mutation out of this response, name the observed constraints, and avoid claiming closure for any unseen path.",
+    "This answer intentionally has no HOLMES pass so the factory-level answer gate must schedule the checkpoint continuation rather than treating read-only work as complete.",
+  ].join(" ");
+
+  const fullPass = (evidenceId = "READ1", repair = "initial") => [
+    "Hone: answer the user's design/debug request without mutating files.",
+    `Observe: README.md was inspected at ¶README.md#${evidenceId}.`,
+    "Ladder: the observed evidence bounds the answer and no unverified file state is used.",
+    "Map: scope remains read-only; no edit, write, or shell mutation is part of the answer.",
+    "Establish: closure is tied to the cited README.md evidence and unresolved items stay explicit.",
+    `Synthesize: ${repair} answer uses ¶README.md#${evidenceId} to close the reasoning chain without mutation.`,
+  ].join("\n");
+
+  const hollowGrade = JSON.stringify({
+    status: "succeeded",
+    verdict: "hollow",
+    defects: [{
+      axis: "closure",
+      severity: "high",
+      detail: "closure is asserted but not linked back to the cited evidence",
+      citedEvidence: ["README.md"],
+    }],
+    requiredAdditions: ["closure"],
+  });
+  const coherentGrade = JSON.stringify({
+    status: "succeeded",
+    verdict: "coherent",
+    defects: [],
+    requiredAdditions: [],
+  });
+
+  function createAnswerGateMock(options: {
+    hasUI?: boolean;
+    sendMessageThrows?: boolean;
+    graderResponses?: string[];
+  } = {}) {
+    const mock = createMockExtensionAPI();
+    const statuses: any[][] = [];
+    let graderCalls = 0;
+    mock.ctx.hasUI = options.hasUI ?? true;
+    (mock.ctx.ui as any).setStatus = (...args: any[]) => {
+      statuses.push(args);
+    };
+    if (options.graderResponses) {
+      (mock.ctx as any).callModel = () => {
+        const response = options.graderResponses![Math.min(graderCalls, options.graderResponses!.length - 1)];
+        graderCalls++;
+        return response;
+      };
+    }
+    if (options.sendMessageThrows) {
+      (mock.pi as any).sendMessage = (...args: any[]) => {
+        mock.sentMessages.push(args);
+        throw new Error("sendMessage unavailable");
+      };
+    }
+    holmes(mock.pi);
+    return { mock, statuses, graderCalls: () => graderCalls };
+  }
+
+  function userContext(text: string) {
+    return {
+      type: "context",
+      messages: [{ role: "user", content: [{ type: "text", text }] }],
+    };
+  }
+
+  function readCall(path = "README.md", toolCallId = "read-1"): ToolCall {
+    return toolCall("read", { path }, toolCallId);
+  }
+
+  function agentEnd() {
+    return { type: "agent_end", messages: [] };
+  }
+
+  async function endAssistantMessage(mock: ReturnType<typeof createMockExtensionAPI>, text: string) {
+    await mock.invoke("message_end", mockMessageEnd([{ type: "text", text }]));
+  }
+
+  function invokeAgentEndNoThrow(mock: ReturnType<typeof createMockExtensionAPI>) {
+    expect(() => mock.invoke("agent_end", agentEnd())).not.toThrow();
+  }
+
+  function expectNextTurnDemand(mock: ReturnType<typeof createMockExtensionAPI>, index = 0): string {
+    expect(mock.sentMessages).toHaveLength(index + 1);
+    const [message, options] = mock.sentMessages[index];
+    expect(options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+    expect(message.customType).toBe("holmes_answer_checkpoint");
+    expect(message.display).toBe(true);
+    expect(typeof message.content).toBe("string");
+    return message.content;
+  }
+
+  async function runtimeStatusText(mock: ReturnType<typeof createMockExtensionAPI>): Promise<string> {
+    await mock.commands.get("holmes-status").handler("", mock.ctx);
+    return mock.notifications.at(-1)?.text ?? "";
+  }
+
+  function statusCounter(status: string, label: string): number {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = status.match(new RegExp(`${escaped}:\\s+(\\d+)`));
+    expect(match).not.toBeNull();
+    return Number(match![1]);
+  }
+
+  async function seedLiveTier3Record(mock: ReturnType<typeof createMockExtensionAPI>) {
+    const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
+    expect(tool).toBeDefined();
+    const result = await withDocFixture((cwd) =>
+      tool.execute(
+        "classify-tier3",
+        docFixtureParams({
+          proposedTier: 3,
+          reasoning: "Tier 3 fixture classification for a bounded docs change; full HOLMES pass is required before mutation.",
+          holmes: {
+            target: "Fix docs fixture typo only.",
+            now: `${DOC_FIXTURE_PATH} is a docs prose file; one misspelled plain text word is identified.`,
+            delta: "Replace misspelled prose with corrected prose.",
+            next: `Apply the exact ${DOC_FIXTURE_PATH} edit, then verify by read-back.`,
+            knownFacts: [`${DOC_FIXTURE_PATH} is documentation prose.`],
+            assumptions: [],
+            unknowns: [],
+          },
+        }),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
+    );
+    expect(result.details?.tier).toBeGreaterThanOrEqual(3);
+  }
+
+  test("read-only-escape regression demands once, then accepts a later full pass", async () => {
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("read-only escape")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    expect(mock.invoke("tool_call", readCall())).toBeUndefined();
+
+    await endAssistantMessage(mock, substantiveNoPassAnswer);
+    invokeAgentEndNoThrow(mock);
+
+    const demand = expectNextTurnDemand(mock);
+    expect(demand).toContain("backward_chain_sections");
+    expect(demand).toContain("verified_evidence");
+    expect(demand).not.toContain(substantiveNoPassAnswer);
+    expect(demand).not.toContain("Hone:");
+
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
+    await endAssistantMessage(mock, fullPass("READ1", "repaired"));
+    invokeAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+  });
+
+  test("read-only switch with a live Tier 3 classification escalates the answer obligation to full", async () => {
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext("Please review this regex behavior."));
+    await seedLiveTier3Record(mock);
+    expect(mock.invoke("tool_call", readCall("README.md", "read-live-tier"))).toBeUndefined();
+
+    await endAssistantMessage(mock, substantiveNoPassAnswer);
+    invokeAgentEndNoThrow(mock);
+
+    const demand = expectNextTurnDemand(mock);
+    expect(demand).toContain("level `full`");
+    expect(demand).toContain("backward_chain_sections");
+    expect(demand).toContain("verified_evidence");
+  });
+
+  test("frictionless-trivial regression has no dispatch, context notice, or grader call", async () => {
+    const { mock, graderCalls } = createAnswerGateMock({ graderResponses: [hollowGrade] });
+    const context = userContext("what does this regex do?");
+    const contextResult = mock.invoke("context", context);
+    expect((contextResult?.messages ?? context.messages)).toHaveLength(context.messages.length);
+
+    await endAssistantMessage(mock, "It matches the literal characters in order and does not mutate anything.");
+    invokeAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(0);
+    expect(mock.notifications).toHaveLength(0);
+    expect(graderCalls()).toBe(0);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Grader calls")).toBe(0);
+  });
+
+  test("hollow reasoning is withheld, then a coherent repair satisfies without quoting expected text", async () => {
+    const { mock, graderCalls } = createAnswerGateMock({ graderResponses: [hollowGrade, coherentGrade] });
+    mock.invoke("context", userContext(fullRequest("hollow coherent repair")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    expect(mock.invoke("tool_call", readCall())).toBeUndefined();
+
+    const firstPass = fullPass("READ1", "initial hollow");
+    await endAssistantMessage(mock, firstPass);
+    invokeAgentEndNoThrow(mock);
+
+    const demand = expectNextTurnDemand(mock);
+    expect(demand).toContain("closure");
+    expect(demand).not.toContain("initial hollow");
+    expect(demand).not.toContain(firstPass);
+
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
+    await endAssistantMessage(mock, fullPass("READ1", "coherent repair"));
+    invokeAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    expect(graderCalls()).toBe(2);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Grader calls")).toBe(2);
+    expect(statusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+    expect(statusCounter(status, "Reasoning soft violations")).toBe(0);
+  });
+
+  test("second hollow repair soft-accepts after one extra turn and never redispatches", async () => {
+    const { mock, graderCalls } = createAnswerGateMock({ graderResponses: [hollowGrade, hollowGrade] });
+    mock.invoke("context", userContext(fullRequest("second hollow repair")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    expect(mock.invoke("tool_call", readCall())).toBeUndefined();
+
+    await endAssistantMessage(mock, fullPass("READ1", "first hollow"));
+    invokeAgentEndNoThrow(mock);
+    expectNextTurnDemand(mock);
+
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
+    await endAssistantMessage(mock, fullPass("READ1", "second hollow"));
+    invokeAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    expect(graderCalls()).toBe(2);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Grader calls")).toBe(2);
+    expect(statusCounter(status, "Grader hollow flags")).toBe(1);
+    expect(statusCounter(status, "Reasoning soft violations")).toBe(1);
+    expect(statusCounter(status, "Answer soft accepts")).toBe(1);
+    expect(statusCounter(status, "Answer checkpoints satisfied")).toBe(0);
+  });
+
+  test("spiral-topology regression stays terminal after a throwing print-mode demand", async () => {
+    const { mock, graderCalls } = createAnswerGateMock({
+      hasUI: false,
+      sendMessageThrows: true,
+      graderResponses: [hollowGrade],
+    });
+    mock.invoke("context", userContext(fullRequest("spiral topology")));
+
+    for (let index = 0; index < 10; index++) {
+      invokeAgentEndNoThrow(mock);
+    }
+
+    expect(mock.sentMessages).toHaveLength(1);
+    expect(graderCalls()).toBe(0);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer soft accepts")).toBe(1);
+    expect(statusCounter(status, "Reasoning soft violations")).toBe(1);
+  });
+
+  test("print-mode demand degrades through sendMessage only and never touches UI methods", async () => {
+    const happy = createAnswerGateMock({ hasUI: false });
+    happy.mock.invoke("context", userContext(fullRequest("print happy")));
+    invokeAgentEndNoThrow(happy.mock);
+
+    expectNextTurnDemand(happy.mock);
+    expect(happy.mock.notifications).toHaveLength(0);
+    expect(happy.statuses).toHaveLength(0);
+
+    const throwing = createAnswerGateMock({ hasUI: false, sendMessageThrows: true });
+    throwing.mock.invoke("context", userContext(fullRequest("print throwing")));
+    invokeAgentEndNoThrow(throwing.mock);
+    invokeAgentEndNoThrow(throwing.mock);
+
+    expect(throwing.mock.sentMessages).toHaveLength(1);
+    expect(throwing.mock.notifications).toHaveLength(0);
+    expect(throwing.statuses).toHaveLength(0);
+    const status = await runtimeStatusText(throwing.mock);
+    expect(statusCounter(status, "Answer soft accepts")).toBe(1);
+    expect(statusCounter(status, "Reasoning soft violations")).toBe(1);
   });
 });
