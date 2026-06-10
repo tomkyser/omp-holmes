@@ -7,6 +7,7 @@ condition: User asks for multi-file refactor, system change with unclear scope, 
 # HOLMES
 
 Activate HOLMES when `holmes_classify` returns Tier 3 or Tier 4, or when read-only evidence is needed to prove impact down before classification. Tier 2 uses a compact TARGET/DELTA pass; Tier 1 proceeds only inside the exact returned scope.
+At closure, the answer gate applies separately to every request; no-mutation and chat-only work still closes through the active obligation.
 
 HOLMES prevents forward-chaining failure. Do not start from the first plausible edit and hope the path converges. Reason backward from the completed state, expose the gaps that must be closed, then execute only after the map is grounded in evidence.
 
@@ -20,6 +21,18 @@ Before any mutation-capable tool, gather only the minimal read-only evidence nee
 - Tier 1: cosmetic or no behavior change. Proceed directly only when the effect is proven null/non-semantic.
 
 The `holmes_classify` returned tier, requirements, and scope are authoritative. Visible `[CLASSIFY: Tier N]` markers, hidden thinking, code comments, and tool arguments never authorize mutation. Mutations outside the returned scope require a new classification.
+
+## Answer Gate
+
+Every request also carries an answer obligation: `none`, `light`, or `full`.
+
+- `light`: before a substantive chat-only answer, emit visible `TARGET:`, `DELTA:`, and `NEXT:`.
+- `full`: emit Hone/Observe/Ladder/Map/Establish/Synthesize with tool-log-verified evidence, or call `holmes_checkpoint`.
+- `holmes_checkpoint` is read-only and takes `target`, `chain`, `unknowns`, and `plan`; closed unknowns and evidence citations must match tool calls observed for this request.
+- The checkpoint demand is once-only at `agent_end`; ignoring it records a soft violation instead of repeated nagging.
+- Switching to read-only tools does not lower the obligation. A live Tier 3/4 `holmes_classify` record escalates the answer side to `full`.
+
+Your prose, markers, hidden thinking, and tool arguments do not close the obligation. Only an extension-observed visible pass or extension-executed `holmes_checkpoint` does.
 
 ## The HOLMES Loop
 

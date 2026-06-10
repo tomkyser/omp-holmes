@@ -1,11 +1,13 @@
 # omp-holmes
 
-HOLMES is a **cognitive enforcement** system for [OMP](https://omp.sh) — not a guidance system. Prompts that *ask* a model to reason carefully are advisory; the model can ignore them. HOLMES instead makes the agent runtime refuse to execute mutations that were never properly reasoned about. It forces backward reasoning from the desired end state and mechanically counters two built-in model tendencies:
+HOLMES is a **cognitive enforcement** system for [OMP](https://omp.sh) — not a guidance system. It makes the agent runtime adjudicate two surfaces: mutations before effectful tools run, and answers before a request is considered closed. Prompts that *ask* a model to reason carefully are advisory; the model can ignore them. HOLMES instead gives trusted extension code the last word: mutation leases come from `holmes_classify`, and answer closure comes from extension-observed visible passes or `holmes_checkpoint`. It mechanically counters two built-in model tendencies:
 
-- **Forward-chaining**: anchoring on the first plausible step, editing immediately, and discovering the important unknowns mid-execution.
-- **Laziness**: shallow exploration, hand-waved impact claims, and skipped verification.
+- **Forward-chaining**: anchoring on the first plausible step, editing immediately, answering from the first story that fits, and discovering the important unknowns mid-execution.
+- **Laziness**: shallow exploration, hand-waved impact claims, skipped verification, and hollow answer reasoning.
 
 It ships as a local OMP extension package: `package.json` declares `omp.extensions`, and `src/main.ts` is the runtime entry point that wires every enforcement surface.
+
+For the conceptual deep-dive — why the framework exists and the harness-independent logic behind it — see [`FRAMEWORK.md`](FRAMEWORK.md).
 
 ## The cognitive model
 
@@ -19,11 +21,11 @@ Layer 0 runs every turn and is the always-on habit the rest of the system enforc
 | **ENVISION** | Define concrete, verifiable "done". |
 | **LOCATE** | Separate KNOWN facts from ASSUMED beliefs and UNKNOWN gaps. |
 | **DELTA** | List required changes and evidence gaps. |
-| **CLASSIFY** | Call the extension-owned `holmes_classify` tool; its returned tier, requirements, and scope are authoritative. |
+| **CLASSIFY** | Before mutation-capable tools, call the extension-owned `holmes_classify` tool; its returned tier, requirements, and scope are authoritative. Answer closure is enforced separately by the answer gate. |
 
 ### The HOLMES loop
 
-For non-trivial work (Tier 3 and above), classification requires the full inner loop:
+For non-trivial mutation work (Tier 3 and above), classification requires the full inner loop:
 
 | Phase | Meaning |
 |-------|---------|
@@ -38,7 +40,33 @@ Tier 4 work iterates the loop until the latest synthesis is a fixed point: no bl
 
 ## Trust architecture: the model proposes, the extension disposes
 
-Nothing the model *says* grants authority. Visible `[CLASSIFY: Tier N]` markers, hidden thinking, code comments, and tool-call arguments never authorize anything — they are untrusted claims. The single mutation authority is the extension-owned `holmes_classify` tool: its execution happens inside trusted extension code, its record is what the runtime gate checks, and its returned tier, requirements, and scope are binding. Mutations outside the returned scope require a new classification.
+Nothing the model *says* grants authority. Visible `[CLASSIFY: Tier N]` markers, hidden thinking, code comments, answer prose, and tool-call arguments are untrusted claims. Mutation authority is the extension-owned `holmes_classify` tool: its execution happens inside trusted extension code, its record is what the runtime mutation gate checks, and its returned tier, requirements, lease, and scope are binding. Answer authority is the answer gate state owned by the extension: only an extension-observed visible pass or an executed `holmes_checkpoint` record can satisfy it. Mutations outside the returned scope require a new classification; answers whose observed facts outgrow their satisfied obligation reopen at the higher level.
+
+## Answer gate
+
+Every user request gets an `AnswerObligationLevel`: `none`, `light`, or `full`.
+
+Initial triage is deterministic:
+
+| Level | Semantics | Triage |
+|-------|-----------|--------|
+| `none` | Trivial answer. No visible ceremony. | Request is below `ANSWER_TRIVIAL_REQUEST_CHARS`, has no code fence, has at most one question, and has no reasoning-verb or multipart markers. |
+| `light` | Substantive but bounded answer. | Default for non-trivial requests that do not need design-grade reasoning. |
+| `full` | Design-grade answer. | Reasoning-heavy request shapes: multiple reasoning verbs, or a reasoning verb combined with code-fence / multipart structure. |
+
+Escalation is monotone and uses only extension-observed facts:
+
+- `none` can escalate to `light` when the final visible answer reaches `ANSWER_SUBSTANTIVE_CHARS`, contains a code block, or the request used at least `ANSWER_TOOLCALL_LIGHT` tool calls.
+- Any level escalates to `full` when the request reaches `ANSWER_TOOLCALL_FULL` tool calls, emits a heavy multi-code-block answer at `ANSWER_HEAVY_CHARS`, or has a live valid Tier 3/4 `holmes_classify` record for the same request digest. That last rule is the gate weld: mutation-side Tier 3/4 analysis forces answer-side `full` closure.
+- A request satisfied at a lower level reopens if later observed facts escalate past `satisfiedAtLevel`. Levels only move `none` → `light` → `full`.
+
+Satisfaction paths:
+
+- `none`: frictionless. `agent_end` marks it satisfied; no checkpoint demand is issued.
+- `light`: visible `TARGET` / `DELTA` / `NEXT` sections, or a successful `holmes_checkpoint`.
+- `full`: visible Hone / Observe / Ladder / Map / Establish / Synthesize sections with at least one evidence reference verified against the request tool log, or a successful `holmes_checkpoint`.
+
+At `agent_end`, an unmet `light` or `full` obligation schedules exactly one `nextTurn` checkpoint demand while `retriesUsed < MAX_ANSWER_RETRIES`. The demand asks for either the missing visible pass or a `holmes_checkpoint` call. If the demand cannot be sent, or the next terminal pass still does not satisfy the obligation, the gate soft-accepts: it records `answerSoftAccepts` and `reasoningSoftViolations` and stops. The bound is one extra turn worst case; the answer gate never hangs the session and never blocks tool execution.
 
 ## The four-tier prove-down impact model
 
@@ -65,11 +93,29 @@ Hard minimum tiers derived **only from extension-observed facts**: file path rol
 
 The **only authority that can lower a tier**. Certificates are computed by the extension itself from the exact planned payloads (the `exactPatch` / `exactContent` the model pre-committed) diffed against the extension's own snapshot of the target files. Examples: blank-line-only, comment-only, docs-prose-only, whitespace-only, AST-equivalent, exports-unchanged, references-bounded, session-scoped-only. Because the extension computes them from real bytes, they are proof — not narrative.
 
-### Layer 3 — the risk prosecutor
+### Layer 3 — the mutation risk prosecutor
 
-An LLM reviewer whose authority is **strictly upward-only**: it can raise concern (add floors, surface proof obligations), never grant safety or lower a tier. It is fed a quarantined packet in which all model-originated text is explicitly labeled as untrusted claims, so a persuasive self-assessment cannot launder itself into authority. If the prosecutor times out or errors, the deterministic result stands.
+An LLM reviewer on the mutation path whose authority is **strictly upward-only**: it can raise concern (add floors, surface proof obligations), never grant safety or lower a tier. It is fed a quarantined packet in which all model-originated text is explicitly labeled as untrusted claims, so a persuasive self-assessment cannot launder itself into authority. If the prosecutor times out or errors, the deterministic result stands.
 
 The shape of the pipeline is the point: facts set the floor, mechanical proof is the only way down, and judgment can only push up.
+
+## Reasoning grader
+
+The reasoning grader is separate from the mutation risk prosecutor. It grades closure quality after deterministic gates have already found a candidate answer pass or Tier 3/4 mutation pass.
+
+It grades exactly three axes:
+
+| Axis | Meaning |
+|------|---------|
+| `chain` | Backward-chain coherence: steps must trace TARGET → NOW and not become orphan forward-chained steps. |
+| `closure` | Unknown closure: every unknown claimed closed must cite an id from `facts.verifiedEvidenceIds`. The grader checks linkage only; it does not decide whether evidence is true. |
+| `plan` | Plan traceability: every plan step must map to a chain step or an explicitly open unknown. |
+
+Authority is deliberately narrow. The grader can only produce suspicion and repair-demand input. It cannot lower tiers, mint certificates, mark `mutation_ready`, satisfy answer obligations, authorize mutation, or clear deterministic floors. For answer `full`, high/medium defects with valid citations to verified evidence, or a hollow/incoherent result with tool calls but no verified evidence, can withhold satisfaction once via `MAX_GRADER_HOLLOW_FLAGS`; after the hollow-flag cap, further hollow/incoherent results become advisory and the gate soft-accepts if it was already awaiting repair. `failed` / `skipped` grader status, malformed output, parse rejection, call errors, and timeouts are inert.
+
+Bounds are explicit: `MAX_GRADER_CALLS_PER_REQUEST` caps uncached calls per request, successful assessments are cached by `graderCacheKey`, answer caches are per request digest (`createReasoningGraderRequestCache`) and pruned on new request digests, and grader calls use `DEFAULT_GRADER_TIMEOUT_MS` unless `HOLMES_GRADER_TIMEOUT_MS_FLAG` (`holmes-grader-timeout-ms`) supplies a valid timeout. The model output budget is `REASONING_GRADER_MAX_TOKENS`.
+
+Mutation-pass grading is default-off. `src/main.ts` registers `HOLMES_GRADE_MUTATION_PASSES_FLAG` as the OMP boolean flag `holmes-grade-mutation-passes`; set that flag to `true` to enable grading after deterministic Tier 3/4 mutation pass readiness. The variant writes grader verdict/axes into the classification record and can add `graderObligations`, but it still cannot lower a tier, create a lease, or satisfy a certificate.
 
 ## Mutation leases
 
@@ -90,11 +136,12 @@ Every user request gets a ledger that accumulates classifications, blocked effec
 
 | Surface | Behavior |
 |---------|----------|
-| System prompt | The HOLMES classification checkpoint is appended on every agent start (`APPEND_SYSTEM.md` is the source copy). |
+| System prompt | The HOLMES classification checkpoint and answer protocol are appended on every agent start (`APPEND_SYSTEM.md` is the source copy). |
 | TTSR rules (8) | Stream-time rules that abort generation mid-stream when the text shows a failure pattern forming. |
 | Skill | `skills/holmes/SKILL.md` — the full HOLMES playbook for on-demand reference. |
 | Commands (3) | `/holmes`, `/holmes-goal`, `/holmes-status`. |
-| Tool-call gates | Runtime `tool_call` interception, in order: primitive-burst → delegation → classification. |
+| Tool-call gates | Runtime `tool_call` interception, in order: primitive-burst → delegation → classification. `holmes_classify` and `holmes_checkpoint` are guard-exempt. |
+| Answer gate | `message_end` / `agent_end` reconciliation: triage, monotone escalation, visible-pass or checkpoint satisfaction, and one-shot `nextTurn` repair demand. |
 | Tool-result modifiers | Verification reminders appended after mutating edit/write/apply-style results; verification outcomes feed the ledger. |
 
 ### Stream-time rules (TTSR)
@@ -112,11 +159,31 @@ Recommended TTSR settings: `repeatMode: "afterGap"` with `repeatGap: 3`, so rule
 
 ### Runtime gates
 
-On every `tool_call`, in order:
+On every `tool_call`, `holmes_classify` and `holmes_checkpoint` bypass the guards. Every other tool call runs, in order:
 
 1. **Primitive burst** — blocks chains of one-off discovery primitives that should be a single batched lookup (URL/resource reads and post-mutation verification reads are exempt).
 2. **Delegation** — blocks invalid HOLMES Task delegation (wrong agent names, non-read-only research assignments).
 3. **Classification** — checks the pending effect against the active lease: covered tool, covered paths, matching effect fingerprint, remaining budget, freshness. Missing classification, scope mismatch, and unbounded impact each get distinct block messages with a safe next action.
+
+### Tool protocol
+
+| Tool | Authority |
+|------|-----------|
+| `holmes_classify` | Mutation classification and lease creation. The returned tier, requirements, scope, lease kind, allowed tools/paths, and mutation budget are authoritative for mutation-capable tools. |
+| `holmes_checkpoint` | Read-only answer checkpoint. It is in `READ_ONLY_TOOLS`, is guard-exempt, and can satisfy an answer obligation without creating mutation authority. |
+
+`holmes_checkpoint` parameters:
+
+```ts
+{
+  target: string;
+  chain: Array<{ step: string; evidence?: string[] }>;
+  unknowns: Array<{ question: string; status: "open" | "closed"; closedBy?: string }>;
+  plan: string[];
+}
+```
+
+Checkpoint evidence is cross-checked against paths/URIs the extension observed in the request tool log. The record separates `verifiedEvidenceIds` from `unverifiedMentions`; at `full`, unverified citations close nothing. A closed unknown must have verified `closedBy` evidence; if the request made tool calls, the checkpoint must also include at least one verified evidence id. With zero tool calls, an open-unknown checkpoint can close the answer because there is no verified-evidence floor to meet.
 
 ### Commands
 
@@ -125,6 +192,8 @@ On every `tool_call`, in order:
 | `/holmes <task>` | Run Layer 0 and the full HOLMES loop on a task before acting. |
 | `/holmes-goal <intent>` | Convert raw intent into a HOLMES-informed `/goal` objective. |
 | `/holmes-status` | Show registered surfaces, classification state, and runtime counters. |
+
+`/holmes-status` reports the session counters from `HolmesStats`, including the answer/grader counters `answerObligationsCreated`, `answerCheckpointsSatisfied`, `answerDemandsIssued`, `answerSoftAccepts`, `graderCalls`, `graderCacheHits`, `graderHollowFlags`, and `reasoningSoftViolations` alongside mutation, prompt, and delegation counters.
 
 ## Delegation protocol
 
@@ -139,9 +208,9 @@ Subagents do not inherit the parent session's classification: a subagent that mu
 
 ## Design philosophy
 
-- **Enforce what you can verify, advise what you cannot.** Path roles, exact payloads, tool results, and ledger state are extension-observable, so they are enforced. Reasoning quality is not directly observable, so it is shaped through prompts, rules, and the skill — and through the consequences below.
-- **Consequences, not nagging.** Bad reasoning is not met with lectures; it becomes effect mismatches, evaporated leases, gate blocks, and Tier 4 verification floors. Sloppiness costs authority, which is the one currency an agent actually optimizes.
-- **Tier 1 stays ceremony-free by design.** A provably cosmetic change proceeds with minimal visible ceremony inside its exact scope. The system is heavy exactly where impact is heavy.
+- **Enforce what you can verify, grade only upward.** Path roles, exact payloads, tool results, ledger state, visible answer sections, and tool-log evidence references are extension-observable, so they are enforced. LLM judgment can only add suspicion or bounded repair obligations; it never grants authority.
+- **Consequences, not nagging.** Bad reasoning is not met with lectures; it becomes effect mismatches, evaporated leases, gate blocks, Tier 4 verification floors, one-shot answer checkpoint demands, and soft-violation counters. Sloppiness costs authority, which is the one currency an agent actually optimizes.
+- **Trivial paths stay ceremony-free by design.** Tier 1 mutations and `none` answer obligations proceed with minimal visible ceremony inside their exact bounds. The system is heavy exactly where impact is heavy.
 
 ## Install and local use
 
@@ -168,8 +237,8 @@ Development:
 
 ```sh
 bun install
-bun test src/main.test.ts   # unit suite
-bun run check               # typecheck
+bun test src/           # unit suite: src/main.test.ts, src/answer.test.ts, src/grader.test.ts
+bun run check           # typecheck
 ```
 
 There is no build step; OMP loads `./src/main.ts` directly via `package.json`'s `omp.extensions`. Marketplace publishing is out of scope.
@@ -178,12 +247,15 @@ There is no build step; OMP loads `./src/main.ts` directly via `package.json`'s 
 
 | Path | Responsibility |
 |------|----------------|
-| `src/main.ts` | Extension factory entry: registers the tool, commands, lifecycle handlers, observation, gates, and result modifiers. |
-| `src/classification.ts` | Deterministic prove-down engine: objective floors, evidence certificates, risk prosecutor, mutation leases, cumulative ledger; registers `holmes_classify`. |
-| `src/observation.ts` | Bounded visible-text observation from message events; HOLMES evidence detection. |
+| `src/main.ts` | Extension factory entry: registers tools, commands, lifecycle handlers, observation, gates, result modifiers, config flags, answer gate wiring, and grader caches. |
+| `src/answer.ts` | Answer gate: triage, monotone escalation, visible-pass compliance, `holmes_checkpoint`, one-shot demands, soft-accepts, and answer-side grader integration. |
+| `src/grader.ts` | Extension-owned reasoning grader: packet construction, model call, citation filtering, cache keys, and upward-only obligation mapping. |
+| `src/classification.ts` | Deterministic prove-down engine: objective floors, evidence certificates, risk prosecutor, mutation leases, cumulative ledger, mutation-pass compliance; registers `holmes_classify`. |
+| `src/observation.ts` | Bounded visible-text observation from message events; HOLMES / answer evidence detection. |
 | `src/guards.ts` | Tool-call gates: primitive burst, delegation, and classification gate dispatch. |
-| `src/prompts.ts` | `HOLMES_SYSTEM_PROMPT`, command prompt builders, verification reminder. |
-| `src/types.ts` | Shared state and type definitions. |
+| `src/prompts.ts` | `HOLMES_SYSTEM_PROMPT`, command prompt builders, verification reminder, and answer protocol prompt text. |
+| `src/types.ts` | Shared constants, config, stats, state, and protocol type definitions. |
+| `src/main.test.ts`, `src/answer.test.ts`, `src/grader.test.ts` | Unit test layout; the package test script runs `bun test src/`. |
 | `rules/` | TTSR rule assets (always-apply `RULES.md` + 7 conditional rules). |
 | `skills/holmes/` | The HOLMES playbook skill and reference files. |
 | `commands/` | Slash-command assets. |
