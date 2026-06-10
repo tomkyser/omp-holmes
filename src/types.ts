@@ -1,13 +1,9 @@
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
-
 export const HOLMES_CLASSIFY_TOOL = "holmes_classify" as const;
 export const HOLMES_RULE_VERSION = "holmes-classify-v1" as const;
-export const LLM_ASSESSOR_PROMPT_VERSION = "holmes-impact-assessor-v1" as const;
-export const LLM_ASSESSOR_SCHEMA_VERSION = "holmes-impact-assessor-output-v1" as const;
 
 export type HolmesTier = 1 | 2 | 3 | 4;
 export type Confidence = "high" | "medium" | "low";
-export type LeaseKind = "exact" | "scope" | "blocked";
+export type LeaseKind = "exact" | "scope" | "scope_only" | "blocked";
 
 export type RuntimeSurface =
   | "none"
@@ -20,6 +16,10 @@ export type RuntimeSurface =
   | "deployment"
   | "concurrency"
   | "agent_guardrail"
+  | "human_audience"
+  | "reputation"
+  | "factual_accuracy"
+  | "coordination_graph"
   | "unknown";
 
 export type OperationKind =
@@ -34,6 +34,10 @@ export type OperationKind =
   | "deployment"
   | "security"
   | "data"
+  | "creative_writing"
+  | "research_synthesis"
+  | "coordination"
+  | "session_artifact"
   | "unknown";
 
 export type OperationClass =
@@ -49,6 +53,9 @@ export type OperationClass =
   | "schema_migration"
   | "deploy_ci"
   | "agent_guardrail"
+  | "session_scaffolding"
+  | "creative_deliverable"
+  | "research_output"
   | "opaque"
   | "unknown";
 
@@ -204,7 +211,11 @@ export type EvidenceCertificateKind =
   | "ast_equivalent"
   | "exports_unchanged"
   | "references_bounded"
-  | "local_only";
+  | "local_only"
+  | "source_material_read"
+  | "factual_cross_reference"
+  | "coordination_plan_bounded"
+  | "session_scoped_only";
 
 export interface EvidenceCertificate {
   kind: EvidenceCertificateKind;
@@ -337,6 +348,8 @@ export interface MutationLease {
   operationClasses: OperationClass[];
   maxMutations: number;
   consumedMutations: number;
+  chargedMutations?: number;
+  chargedPaths?: string[];
   effectFingerprints: string[];
   exactOpaqueInputs: Record<string, string[]>;
   fileStateFingerprints: Record<string, string>;
@@ -346,7 +359,7 @@ export interface MutationLease {
 export interface OpenUnknown {
   id: string;
   text: string;
-  source: "classifier" | "model_params" | "tool_log" | "user_request" | "llm_assessor";
+  source: "classifier" | "model_params" | "tool_log" | "user_request";
   blocking: boolean;
   resolvedByEvidenceRefs: EvidenceRef[];
 }
@@ -366,31 +379,6 @@ export interface ClassificationProcessState {
 
 export type ProcessState = ClassificationProcessState;
 
-export interface LlmImpactAssessment {
-  attempted: boolean;
-  used: boolean;
-  status:
-    | "not_needed"
-    | "succeeded"
-    | "timeout"
-    | "unavailable"
-    | "malformed"
-    | "error";
-  modelId?: string;
-  promptVersion: string;
-  outputSchemaVersion: string;
-  recommendedTier?: Exclude<HolmesTier, 1>;
-  confidence?: Confidence;
-  predictedBehaviorChange?: string;
-  affectedSystems?: string[];
-  downstreamEffects?: string[];
-  uncertainty?: Confidence;
-  requiredVerification?: string[];
-  citedEvidence?: string[];
-  rawOutputDigest?: string;
-  errorMessage?: string;
-  durationMs?: number;
-}
 
 export interface SourceDigests {
   userRequestDigest: string;
@@ -425,8 +413,9 @@ export interface ClassificationRecord {
   consumedMutations: number;
   valid: boolean;
   invalidatedBy?: InvalidationReason;
-  llmAssessment?: LlmImpactAssessment;
   riskProsecutorAssessment?: RiskProsecutorAssessment;
+  impactRationale: string;
+  proofBlocker?: string;
   rationale: string;
 }
 
@@ -479,6 +468,13 @@ export interface ScopedFloorEntry {
   supersededBy?: string;
 }
 
+export interface VerificationFailureEntry {
+  key: string;
+  toolName: string;
+  paths: string[];
+  resolvedBy?: string;
+}
+
 export interface CumulativeScopeLedger {
   userRequestDigest: string;
   pathsMentioned: string[];
@@ -493,6 +489,7 @@ export interface CumulativeScopeLedger {
   blockedEffects: string[];
   allowedEffects: string[];
   verificationFailures: string[];
+  verificationFailureEntries?: VerificationFailureEntry[];
   broadenedScopeEvents: EvidenceRef[];
   openUnknowns: OpenUnknown[];
   impactSignals: ImpactSignal[];
@@ -574,8 +571,9 @@ export interface ProveDownResult {
   floors: ImpactFloor[];
   ceilings: ImpactCeiling[];
   missingProof: FailedProofObligation[];
-  llmAssessment?: LlmImpactAssessment;
   riskProsecutorAssessment?: RiskProsecutorAssessment;
+  impactRationale: string;
+  proofBlocker?: string;
   rationale: string;
 }
 
@@ -680,17 +678,13 @@ export interface HolmesClassifyDetails {
   requirements: ClassificationRequirement[];
   scope: ScopeEnvelope;
   lease: MutationLease;
-  llmAssessment?: LlmImpactAssessment;
   riskProsecutorAssessment?: RiskProsecutorAssessment;
+  impactRationale: string;
+  proofBlocker?: string;
   rationale: string;
   nextObligation: string;
 }
 
-export type LlmImpactAssessor = (args: {
-  snapshot: ClassificationSnapshot;
-  deterministic: ProveDownResult;
-  signal: AbortSignal;
-}) => Promise<LlmImpactAssessment>;
 
 export type RiskProsecutorAssessor = (args: {
   snapshot: ClassificationSnapshot;
@@ -703,7 +697,6 @@ export interface HolmesStats {
   turnsStarted: number;
   toolCallsIntercepted: number;
   primitiveBurstsBlocked: number;
-  reasoningReminders: number;
   verifyRemindersAppended: number;
   systemPromptAppends: number;
   visibleMarkersObserved: number;
@@ -713,9 +706,6 @@ export interface HolmesStats {
   classificationsCreated: number;
   classificationGateBlocks: number;
   classificationRecordsInvalidated: number;
-  llmAssessorAttempts: number;
-  llmAssessorSuccesses: number;
-  llmAssessorFailures: number;
 }
 
 export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
@@ -725,6 +715,13 @@ export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set([
   "ast_grep",
   "web_search",
   HOLMES_CLASSIFY_TOOL,
+]);
+
+export const SESSION_TOOLS: ReadonlySet<string> = new Set([
+  "todo_write",
+  "ask",
+  "lsp",
+  "report_tool_issue",
 ]);
 
 export const KNOWN_EFFECTFUL_TOOLS: ReadonlySet<string> = new Set([
@@ -773,161 +770,6 @@ export const BASH_FILE_PRIMITIVE = /(^|[;&|()\s])(?:cat|head|tail|less|more|ls|g
 export const URL_RESOURCE = /^(?:https?:\/\/|pr:\/\/|issue:\/\/|agent:\/\/|artifact:\/\/|memory:\/\/|skill:\/\/|rule:\/\/|local:\/\/|vault:\/\/|mcp:\/\/)/;
 export const CLASSIFY_MARKER = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:HOLMES\s*:\s*Tier\s*([1234])|\[?\s*CLASSIFY\s*:\s*Tier\s*([1234])\s*\]?|\[\s*Tier\s*([1234])\s*\])/i;
 export const LAYER0_TERMS = /\b(?:HALT|ENVISION|LOCATE|DELTA|CLASSIFY|TARGET|NOW|NEXT|Tier\s*[1234]|Hone|Observe|Ladder|Map|Establish|Synthesize)\b/i;
-
-export function buildHolmesClassifyParamsSchema(Type: ExtensionAPI["typebox"]["Type"]) {
-  const HolmesTierSchema = Type.Union([
-    Type.Literal(1),
-    Type.Literal(2),
-    Type.Literal(3),
-    Type.Literal(4),
-  ]);
-
-  const OperationKindSchema = Type.Union([
-    Type.Literal("mechanical_text"),
-    Type.Literal("mechanical_code"),
-    Type.Literal("config_metadata"),
-    Type.Literal("behavior_change"),
-    Type.Literal("refactor"),
-    Type.Literal("test"),
-    Type.Literal("dependency"),
-    Type.Literal("migration"),
-    Type.Literal("deployment"),
-    Type.Literal("security"),
-    Type.Literal("data"),
-    Type.Literal("unknown"),
-  ]);
-
-  const StructuredEffectSchema = Type.Union([
-    Type.Object(
-      {
-        kind: Type.Literal("edit"),
-        path: Type.String({ minLength: 1, maxLength: 500 }),
-        exactPatch: Type.String({ maxLength: 32_000 }),
-        semanticClassClaim: Type.Optional(Type.String({ maxLength: 200 })),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("write"),
-        path: Type.String({ minLength: 1, maxLength: 500 }),
-        exactContent: Type.String({ maxLength: 64_000 }),
-        replacementClassClaim: Type.Optional(Type.String({ maxLength: 200 })),
-      },
-      { additionalProperties: false },
-    ),
-    Type.Object(
-      {
-        kind: Type.Literal("ast_edit"),
-        paths: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 64 }),
-        exactOps: Type.String({ maxLength: 32_000 }),
-        expectedMatchCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 500 })),
-      },
-      { additionalProperties: false },
-    ),
-  ]);
-
-  const PlannedActionSchema = Type.Object(
-    {
-      toolName: Type.String({ minLength: 1, maxLength: 80 }),
-      paths: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 64 }),
-      operationKind: OperationKindSchema,
-      summary: Type.String({ minLength: 1, maxLength: 2_000 }),
-      exactOpaqueInput: Type.Optional(Type.String({ maxLength: 16_000 })),
-      structuredEffect: Type.Optional(StructuredEffectSchema),
-    },
-    { additionalProperties: false },
-  );
-
-  return Type.Object(
-    {
-      proposedTier: HolmesTierSchema,
-      target: Type.Object(
-        {
-          summary: Type.String({ minLength: 1, maxLength: 4_000 }),
-          files: Type.Array(Type.String({ minLength: 1, maxLength: 500 }), { maxItems: 64 }),
-          tools: Type.Array(Type.String({ minLength: 1, maxLength: 80 }), { maxItems: 24 }),
-          operationKind: OperationKindSchema,
-          expectedMutationCount: Type.Optional(Type.Integer({ minimum: 0, maximum: 50 })),
-        },
-        { additionalProperties: false },
-      ),
-      impact: Type.Optional(
-        Type.Object(
-          {
-            userIntentSummary: Type.String({ maxLength: 2_000 }),
-            intendedReceivedEffect: Type.String({ maxLength: 2_000 }),
-            predictedBehaviorChange: Type.String({ maxLength: 2_000 }),
-            affectedSystems: Type.Array(Type.String({ maxLength: 200 }), { maxItems: 32 }),
-            downstreamEffects: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 32 }),
-            contractChanges: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 32 }),
-            dataEffects: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 32 }),
-            safetySecurityEffects: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 32 }),
-            reversibility: Type.Union([
-              Type.Literal("trivial"),
-              Type.Literal("bounded"),
-              Type.Literal("difficult"),
-              Type.Literal("unknown"),
-            ]),
-            confidence: Type.Union([
-              Type.Literal("high"),
-              Type.Literal("medium"),
-              Type.Literal("low"),
-            ]),
-            assumptions: Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 }),
-            unknowns: Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 }),
-          },
-          { additionalProperties: false },
-        ),
-      ),
-      intentAlignment: Type.Optional(
-        Type.Object(
-          {
-            claimedAlignment: Type.Union([
-              Type.Literal("aligned"),
-              Type.Literal("partial"),
-              Type.Literal("mismatch"),
-              Type.Literal("unknown"),
-            ]),
-            explanation: Type.String({ maxLength: 2_000 }),
-          },
-          { additionalProperties: false },
-        ),
-      ),
-      reasoning: Type.String({ minLength: 1, maxLength: 12_000 }),
-      holmes: Type.Optional(
-        Type.Object(
-          {
-            target: Type.Optional(Type.String({ maxLength: 4_000 })),
-            now: Type.Optional(Type.String({ maxLength: 4_000 })),
-            delta: Type.Optional(Type.String({ maxLength: 4_000 })),
-            next: Type.Optional(Type.String({ maxLength: 4_000 })),
-            fullLoop: Type.Optional(
-              Type.Object(
-                {
-                  hone: Type.Optional(Type.String({ maxLength: 4_000 })),
-                  observe: Type.Optional(Type.String({ maxLength: 4_000 })),
-                  ladder: Type.Optional(Type.String({ maxLength: 4_000 })),
-                  map: Type.Optional(Type.String({ maxLength: 4_000 })),
-                  establish: Type.Optional(Type.String({ maxLength: 4_000 })),
-                  synthesize: Type.Optional(Type.String({ maxLength: 4_000 })),
-                },
-                { additionalProperties: false },
-              ),
-            ),
-            knownFacts: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 })),
-            assumptions: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 })),
-            unknowns: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 })),
-            tradeoffs: Type.Optional(Type.Array(Type.String({ maxLength: 1_000 }), { maxItems: 32 })),
-          },
-          { additionalProperties: false },
-        ),
-      ),
-      plannedActions: Type.Array(PlannedActionSchema, { maxItems: 50 }),
-    },
-    { additionalProperties: false },
-  );
-}
 
 export function createObservationState(turnIndex = 0): MessageObservationState {
   return {
@@ -991,7 +833,6 @@ export function createStats(): HolmesStats {
     turnsStarted: 0,
     toolCallsIntercepted: 0,
     primitiveBurstsBlocked: 0,
-    reasoningReminders: 0,
     verifyRemindersAppended: 0,
     systemPromptAppends: 0,
     visibleMarkersObserved: 0,
@@ -1001,8 +842,5 @@ export function createStats(): HolmesStats {
     classificationsCreated: 0,
     classificationGateBlocks: 0,
     classificationRecordsInvalidated: 0,
-    llmAssessorAttempts: 0,
-    llmAssessorSuccesses: 0,
-    llmAssessorFailures: 0,
   };
 }

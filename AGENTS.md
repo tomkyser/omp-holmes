@@ -1,28 +1,33 @@
 # omp-holmes
 
-OMP plugin implementing the HOLMES cognitive redirect and reasoning enforcement framework.
+OMP extension implementing the HOLMES cognitive redirect and reasoning enforcement framework.
 
 ## Structure
-- `rules/` — TTSR rules (stream-time guardrails)
+- `src/` — runtime extension: `main.ts` factory entry, classification engine, observation, guards, prompts, types, and `main.test.ts` unit suite
+- `rules/` — TTSR rules; conditions are JavaScript `new RegExp`-compatible regex, not PCRE
 - `skills/holmes/` — full HOLMES playbook skill + reference files
-- `agents/` — subagent definitions (researcher, verifier)
-- `commands/` — slash commands (/holmes, /holmes-goal)
-- `hooks/pre/` — pre-tool-call enforcement hooks
-- `hooks/post/` — post-tool-call enforcement hooks
-- `research/` — original design documents (historical)
-- `.planning/` — living plan document
+- `agents/` — source contract text for Task `explore`/`oracle` delegation; not native agent names
+- `commands/` — slash-command assets (`/holmes`, `/holmes-goal`)
+- `research/` — historical RALPH design docs
+- `.planning/` — living plan, reviews, and test reports
 
 ## Build
-No build step. All files are directly consumed by OMP's plugin loader.
+No build step. OMP loads `./src/main.ts` via `package.json` `omp.extensions`.
 
-## Install locally
+`bun test src/main.test.ts` runs the unit suite; `bun run check` typechecks.
+
+## Use locally
+Use the extension root:
+```sh
+omp --extension ./
 ```
-omp install ./
+
+Or configure `.omp/settings.json`:
+```json
+{"extensions": ["./"]}
 ```
 
 ## Conventions
-- TTSR rules use PCRE regex in `condition` field
-- Hooks are TypeScript modules with a default-exported factory
 - Skills use YAML frontmatter + Markdown body
-- Subagent definitions use YAML frontmatter + Markdown system prompt
-- Commands are Markdown with YAML frontmatter and $ARGUMENTS substitution
+- Commands are Markdown with YAML frontmatter and `$ARGUMENTS` substitution
+- Package-local `agents/*.md` files are retained source contracts for bundled Task agents, not runtime-discovered agent names

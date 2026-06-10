@@ -20,16 +20,16 @@ display(facts);
 return facts;
 ```
 
-Keep the batch bounded: fixed file list or narrow `find` result, compact returned facts, no hidden mutation unless the step is explicitly a transform step.
+Keep the batch bounded: fixed file list or narrow `find` result, compact returned facts, no hidden mutation. `eval` is effectful by default, so use it only when `holmes_classify` has approved the exact batch scope or the step is explicitly a classified transform step.
 
 ## Execution tags in a plan
 
 ```markdown
 1. [specialized-tool] Use AST search to find `parseRequest(...)` call shapes.
 2. [batch-eval] Read the matched files and summarize argument contracts.
-3. [delegate] Ask `holmes-researcher` to trace external consumers of the public type.
+3. [delegate] Use Task with `agent: "explore"` and embed the researcher contract: read-only, no edits/builds/formatters, bounded factual question, file/line evidence, consumers, unknowns, and searches.
 4. [direct-primitive] Edit the single parser branch once the contract is proven.
-5. [delegate] Ask `holmes-verifier` to check acceptance criteria and targeted tests.
+5. [delegate] Use Task with `agent: "oracle"` and embed the verifier contract: no edits, changed files plus acceptance criteria, targeted checks only, PASS/FAIL/BLOCKED with evidence.
 ```
 
 Tags describe execution mechanics, not importance. Use them to prevent accidental primitive-call chains.

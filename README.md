@@ -1,4 +1,3 @@
-test
 # omp-holmes
 
 HOLMES is a cognitive redirect and reasoning enforcement package for [OMP](https://omp.sh). It is a local OMP extension package: `package.json` declares `omp.extensions`, and `src/main.ts` is the runtime entry point that wires the extension surfaces.
@@ -42,7 +41,8 @@ The runtime code is split into focused modules:
 | `src/types.ts` | Shared state interfaces and OMP event-related type definitions |
 | `src/observation.ts` | Bounded visible-text observation from `message_update` and `message_end`; HOLMES evidence detection and accumulation |
 | `src/guards.ts` | Pure guard decisions for visible reasoning evidence, primitive exploration bursts, and Task delegation |
-| `src/prompts.ts` | `HOLMES_SYSTEM_PROMPT`, command prompt builders, visible marker instructions, and delegation protocol text |
+| `src/prompts.ts` | `HOLMES_SYSTEM_PROMPT`, command prompt builders, and delegation protocol text |
+| `src/classification.ts` | Deterministic prove-down engine: objective impact floors, evidence certificates, risk prosecutor, mutation leases, cumulative request ledger; registers the `holmes_classify` tool |
 
 `package.json` points OMP at `./src/main.ts`:
 
@@ -58,25 +58,23 @@ The runtime code is split into focused modules:
 
 | Surface | Active behavior |
 |---------|-----------------|
-| System prompt | Appends HOLMES Layer 0, Tier 2/3 inner loop, tool-call discipline, visible marker requirements, and delegation protocol on `before_agent_start` |
-| TTSR rules (`rules/`, 7 files) | Package-root discovery activates the rule surface: seven rule files are discovered; the conditional TTSR rules interrupt forward-chaining, assumption-to-action leaps, primitive batching, unverified edit plans, and eval-bypass intent; `RULES.md` is the always-apply compact redirect |
+| System prompt | Appends HOLMES Layer 0, 4-tier prove-down classification, `holmes_classify` authority, tool-call discipline, and delegation protocol on `before_agent_start` |
+| TTSR rules (`rules/`, 8 files) | Package-root discovery activates the rule surface: eight rule files are discovered; the conditional TTSR rules interrupt forward-chaining, assumption-to-action leaps, primitive batching, unverified edit plans, eval-bypass intent, and filesystem-mutation code inside eval; `RULES.md` is the always-apply compact redirect |
 | Skill | `skills/holmes/SKILL.md` remains the full HOLMES playbook for on-demand reference |
 | Commands (3) | `/holmes`, `/holmes-goal`, and `/holmes-status` |
 | Message observation | `message_update` and `message_end` accumulate bounded visible assistant text and detect HOLMES evidence before tools run |
-| Tool call gates | `tool_call` blocks mutating tools without visible classification, primitive exploration bursts, invalid HOLMES Task delegation, and shell/file primitive misuse |
+| Tool call gates | `tool_call` enforces `holmes_classify` scope for mutating tools, primitive exploration bursts, invalid HOLMES Task delegation, and shell/file primitive misuse |
 | Tool result modifiers | `tool_result` appends verification reminders after mutating edit/write/apply-style results |
 
-## Visible classification marker protocol
+## Classification tool protocol
 
-Before any mutating tool call, the assistant must emit a visible marker:
+Before any mutation-capable tool call, the assistant must call the extension-owned `holmes_classify` tool.
 
-```text
-[CLASSIFY: Tier N]
-```
+HOLMES uses four prove-down tiers: Tier 4 potential cascading or unresolved impact, Tier 3 bounded impact that still needs HOLMES analysis, Tier 2 predictable local behavior change, and Tier 1 cosmetic/no behavior change. Start at the highest plausible tier and prove down with evidence.
 
-Use `Tier 1`, `Tier 2`, or `Tier 3` according to the HOLMES gap classification. Hidden thinking, tool-call arguments, and private chain-of-thought do not satisfy the gate; the marker must appear in visible assistant text before mutation. Tier 2/3 turns should also include the HOLMES reasoning packet needed to justify action.
+The classifier's returned tier, requirements, and scope are authoritative. Visible `[CLASSIFY: Tier N]` markers, hidden thinking, and tool-call arguments do not authorize mutation.
 
-The mutating surface includes file edits and apply-style operations such as `edit`, `write`, `ast_edit`, `resolve`, and shell commands that can mutate state.
+The mutating surface is unchanged: file edits and apply-style operations such as `edit`, `write`, `ast_edit`, `resolve`, and mutating shell commands require classifier scope.
 
 ## Delegation protocol
 
@@ -89,7 +87,7 @@ The package-local `agents/` files are retained as source contract text. They are
 
 ## TTSR rules and eval-bypass protection
 
-The `rules/` directory is active when the package root is loaded with `omp --extension ./` or `"extensions": ["./"]`. Seven rule files are discovered; the rule conditions use JavaScript/Bun-compatible `new RegExp(...)` syntax.
+The `rules/` directory is active when the package root is loaded with `omp --extension ./` or `"extensions": ["./"]`. Eight rule files are discovered; the rule conditions use JavaScript/Bun-compatible `new RegExp(...)` syntax.
 
 Active rule files:
 
@@ -100,8 +98,9 @@ Active rule files:
 - `batch-primitive-numbered.md` — blocks numbered primitive discovery chains
 - `edit-without-verify.md` — blocks edit plans that omit verification
 - `eval-mutation-intent.md` — blocks attempts to use `eval` as a mutation-gate bypass
+- `eval-mutation-code.md` — blocks filesystem-mutation code inside eval cells (scope: tool:eval)
 
-`eval` remains appropriate for batched read-only discovery. Filesystem mutation must go through the normal mutating tools after the visible classification marker is emitted.
+`eval` is effectful by default. Batched read-only discovery uses `read`, `search`, `find`, and `ast_grep`; filesystem mutation must go through the normal mutating tools inside the classifier-returned scope.
 
 ## Commands
 
@@ -113,15 +112,15 @@ Active rule files:
 
 ## Tool call discipline
 
-HOLMES enforces a simple rule: architect exploration as scripts. For multi-step file discovery or investigation, batch work inside `eval()` with a small JS/Python plan returning only the facts needed for the next decision.
+HOLMES treats `eval` as effectful by default. Use read-only discovery tools (`read`, `search`, `find`, `ast_grep`, and `web_search`) for evidence gathering before classification.
 
-Direct primitives (`read`, `search`, `find`) are reserved for:
+Direct read-only primitives are appropriate for:
 
 - one-shot lookups of a specific file or symbol
 - hashline anchor capture immediately before an edit
 - post-edit verification reads
 
-The runtime gate blocks primitive exploration bursts while exempting URL/resource reads and verification reads immediately after mutating tools.
+Use `eval` only after `holmes_classify` returns scope that explicitly covers it. The runtime gate blocks primitive exploration bursts while exempting URL/resource reads and verification reads immediately after mutating tools.
 
 ## File structure
 
@@ -130,10 +129,12 @@ omp-holmes/
   package.json                              # Extension manifest: omp.extensions -> ./src/main.ts
   src/
     main.ts                                 # Entry point factory and event wiring
+    classification.ts                       # Deterministic prove-down engine and holmes_classify tool registration
     types.ts                                # Shared state and type definitions
     observation.ts                          # Message text observation and evidence detection
     guards.ts                               # Pure reasoning, primitive burst, and delegation guards
     prompts.ts                              # System prompt and command prompt builders
+    main.test.ts                            # Unit suite for runtime, guards, and classification behavior
   APPEND_SYSTEM.md                          # Source copy of the HOLMES system-prompt appendage
   skills/
     holmes/
@@ -143,12 +144,6 @@ omp-holmes/
   commands/
     holmes.md                               # Package slash-command asset
     holmes-goal.md                          # Package slash-command asset
-  hooks/
-    pre/
-      tool-discipline.ts                    # Legacy/source hook asset; runtime gate is in src/
-      reasoning-guard.ts                    # Legacy/source hook asset; runtime gate is in src/
-    post/
-      verify-reminder.ts                    # Legacy/source hook asset; runtime modifier is in src/
   rules/
     RULES.md                                # Always-apply compact redirect
     forward-chain-guard.md                  # Active rule asset
@@ -157,9 +152,13 @@ omp-holmes/
     batch-primitive-numbered.md             # Active rule asset
     edit-without-verify.md                  # Active rule asset
     eval-mutation-intent.md                 # Active rule asset
+    eval-mutation-code.md                   # Active rule asset
   agents/
     holmes-researcher.md                    # Source contract text for bundled Task/explore delegation
     holmes-verifier.md                      # Source contract text for bundled Task/oracle verification
+  research/                                 # Historical RALPH design docs
+    REFERENCES.md                           # CC-era external-resource index
+  .planning/                                # Living plan, reviews, and test reports
 ```
 
 ## Background
@@ -171,4 +170,3 @@ The core insight: classify the gap, not the request. Complexity lives in the del
 ## License
 
 MIT
-

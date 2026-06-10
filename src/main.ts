@@ -121,9 +121,6 @@ export default function holmes(pi: ExtensionAPI): void {
         `  Classification gate blocks:  ${stats.classificationGateBlocks}`,
         `  Classifications created:     ${stats.classificationsCreated}`,
         `  Records invalidated:         ${stats.classificationRecordsInvalidated}`,
-        `  LLM assessor attempts:       ${stats.llmAssessorAttempts}`,
-        `  LLM assessor successes:      ${stats.llmAssessorSuccesses}`,
-        `  LLM assessor failures:       ${stats.llmAssessorFailures}`,
         `  Verify reminders appended:   ${stats.verifyRemindersAppended}`,
         `  System prompt appends:       ${stats.systemPromptAppends}`,
         `  Visible markers observed:    ${stats.visibleMarkersObserved}`,
@@ -252,7 +249,7 @@ export default function holmes(pi: ExtensionAPI): void {
 
     if (event.toolName === HOLMES_CLASSIFY_TOOL) return undefined;
 
-    const result = appendVerifyReminder(event as HolmesToolResultEvent);
+    const result = appendVerifyReminder(event);
     if (result) stats.verifyRemindersAppended++;
     return result;
   });

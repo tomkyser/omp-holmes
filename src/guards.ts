@@ -19,6 +19,7 @@ import {
 import {
   handleClassificationGate as evaluateClassificationGate,
 } from "./classification";
+import { VERIFY_REMINDER } from "./prompts";
 
 export interface HolmesToolCallEvent {
   type?: "tool_call";
@@ -32,16 +33,13 @@ export interface HolmesToolResultEvent {
   toolCallId?: string;
   toolName: string;
   input: Record<string, unknown>;
-  content: Array<{ type: "text"; text: string } | { type: "image"; [key: string]: unknown }>;
+  content: Array<{ type: "text"; text: string } | { type: "image" }>;
   isError: boolean;
   details?: unknown;
 }
 
 type ToolCallGateResult = { block?: boolean; reason?: string };
-type ToolResultGateResult = { content?: HolmesToolResultEvent["content"]; details?: unknown; isError?: boolean };
 
-const VERIFY_REMINDER =
-  "Verify this change landed correctly: read the affected file and confirm the edit matches your intent.";
 
 export function resetPrimitiveBurst(state: PrimitiveBurstState): void {
   state.burst = 0;
@@ -64,7 +62,6 @@ export function handleClassificationGate(args: {
   delegation: DelegationState;
   repeatedBlockLimit?: number;
 }): ToolCallGateResult | undefined {
-  void args.repeatedBlockLimit;
   return evaluateClassificationGate(args);
 }
 
@@ -107,8 +104,8 @@ export function handlePrimitiveBurst(
       "[HOLMES primitive-burst gate] Primitive exploration chain detected (" +
       state.burst +
       " consecutive). " +
-      "Replace this primitive lookup chain with one read-only eval() cell that calls " +
-      "read/search/find/ast_grep together, or narrow the investigation before continuing. " +
+      "Use one targeted lookup with exempt tools only (read/search/find/ast_grep/web_search), " +
+      "narrowing the path, query, URL, or AST pattern before continuing. " +
       "Direct primitives are for targeted one-shot lookups, anchor capture, or post-edit verification.",
   };
 }
@@ -157,9 +154,15 @@ export function handleDelegationGuard(
   return undefined;
 }
 
-export function appendVerifyReminder(
-  event: HolmesToolResultEvent,
-): ToolResultGateResult | undefined {
+function isTextEntry(entry: { type: string }): entry is { type: "text"; text: string } {
+  return entry.type === "text" && typeof (entry as { text?: unknown }).text === "string";
+}
+
+export function appendVerifyReminder<C extends { type: string }>(event: {
+  toolName: string;
+  isError: boolean;
+  content?: C[];
+}): { content: (C | { type: "text"; text: string })[] } | undefined {
   if (event.toolName === HOLMES_CLASSIFY_TOOL) return undefined;
   if (!VERIFY_TOOLS.has(event.toolName)) return undefined;
   if (event.isError) return undefined;
@@ -172,7 +175,7 @@ export function appendVerifyReminder(
   if (content.length === 0) return { content: [reminder] };
 
   const last = content[content.length - 1];
-  if (last?.type !== "text") {
+  if (last === undefined || !isTextEntry(last)) {
     return { content: [...content, reminder] };
   }
 

@@ -6,13 +6,20 @@ condition: User asks for multi-file refactor, system change with unclear scope, 
 
 # HOLMES
 
-Activate HOLMES for Tier 2/3 work: multi-file changes, ambiguous requests, system design, unknown root causes, or any task where the route from current state to done is not obvious. Skip it for Tier 1 mechanical edits where the target, transform, and verification are already clear.
+Activate HOLMES when `holmes_classify` returns Tier 3 or Tier 4, or when read-only evidence is needed to prove impact down before classification. Tier 2 uses a compact TARGET/DELTA pass; Tier 1 proceeds only inside the exact returned scope.
 
 HOLMES prevents forward-chaining failure. Do not start from the first plausible edit and hope the path converges. Reason backward from the completed state, expose the gaps that must be closed, then execute only after the map is grounded in evidence.
 
-## Visible Marker Gate
+## Classification Tool Gate
 
-Before any mutating tool, first emit visible assistant text with one classification marker: `[CLASSIFY: Tier 1]`, `## HOLMES: Tier 2`, or `## HOLMES: Tier 3`. Hidden thinking, tool-call arguments, and code comments do not count. For Tier 2/3, include compact visible `TARGET`, `DELTA`, and `NEXT` lines when they help the user follow the route; the marker is the mechanical gate.
+Before any mutation-capable tool, gather only the minimal read-only evidence needed, then call the extension-owned `holmes_classify` tool. Classify the finished-work impact with the four-tier prove-down model: start at the highest plausible tier, then prove down with positive evidence.
+
+- Tier 4: potential cascading or unresolved impact. Continue HOLMES passes until blockers close, impact is bounded, and a concrete mutation scope exists.
+- Tier 3: bounded impact that still needs HOLMES analysis. Complete one full HOLMES pass before mutation.
+- Tier 2: predictable local behavior change or bounded content/document work from known inputs. State TARGET and DELTA before mutation.
+- Tier 1: cosmetic or no behavior change. Proceed directly only when the effect is proven null/non-semantic.
+
+The `holmes_classify` returned tier, requirements, and scope are authoritative. Visible `[CLASSIFY: Tier N]` markers, hidden thinking, code comments, and tool arguments never authorize mutation. Mutations outside the returned scope require a new classification.
 
 ## The HOLMES Loop
 
@@ -30,11 +37,12 @@ Do not infer from naming alone. Do not assume a single caller, format, or branch
 
 ### L — Ladder the gaps
 
-Classify every open gap:
+Classify every open gap against the four-tier prove-down evidence:
 
-- Tier 1: Known target, known transform, known verification, small scope. Execute directly after the marker.
-- Tier 2: Known facts but broad or multi-step surface. Reason once, map batches and delegation, then execute after the marker.
-- Tier 3: Any assumption, factual unknown, architectural decision, root-cause gap, or sequencing risk remains. Resolve or delegate before mutation.
+- Tier 4: cascading or unresolved impact remains; continue research or HOLMES passes until the scope is bounded.
+- Tier 3: scope is bounded but assumptions, architectural decisions, root-cause gaps, or sequencing risks still need HOLMES analysis.
+- Tier 2: facts are known and the impact is predictable and local; TARGET/DELTA plus the `holmes_classify` returned scope is enough to execute.
+- Tier 1: impact is proven cosmetic/null; execute directly only inside the `holmes_classify` returned scope.
 
 Build the ladder from current state to finished state: prerequisites, decisions, edit groups, dependency order, and verification gates. Each rung must remove one uncertainty or create one required condition.
 

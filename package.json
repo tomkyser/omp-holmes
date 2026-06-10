@@ -2,6 +2,15 @@
   "name": "omp-holmes",
   "version": "1.0.0",
   "description": "A plugin that implements the HOLMES cognitive redirect and reasoning enforcement framework.",
+  "scripts": {
+    "test": "bun test src/main.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@oh-my-pi/pi-coding-agent": "^15.10.12",
+    "@types/bun": "^1.3.14",
+    "typescript": "^5.9.0"
+  },
   "omp": {
     "extensions": [
       "./src/main.ts"

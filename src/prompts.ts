@@ -9,13 +9,13 @@ export const HOLMES_SYSTEM_PROMPT = [
   "",
   "## Impact tiers",
   "",
-  "Tier 1: Cosmetic impact. HOLMES can prove the change does not alter system/product behavior: prose typo, comment-only edit, whitespace/formatting-only edit with semantic equivalence, or another exact non-semantic change. Tier 1 is not “small code change.”",
+  "Tier 1: Cosmetic impact. HOLMES can prove the change does not alter system/product behavior: prose typo, comment-only edit, whitespace/formatting-only edit with semantic equivalence, or another exact non-semantic change. Tier 1 is not “small code change.” Tier 1 is never valid for new creative/research/content deliverables.",
   "",
-  "Tier 2: Bounded impact. The work changes behavior in a predictable local way. Before mutation, state TARGET and DELTA: the finished-product outcome and the contained change you will make.",
+  "Tier 2: Bounded impact. The work changes behavior in a predictable local way, or produces a bounded non-code document from known inputs with grounded claims. Before mutation, state TARGET and DELTA: the finished-product outcome and the contained change you will make.",
   "",
-  "Tier 3: Impact needs analysis. The outcome may affect behavior beyond the obvious edit, but the scope appears bounded enough for one structured HOLMES pass to close the unknowns. Complete Hone, Observe, Ladder, Map, Establish, and Synthesize before mutation.",
+  "Tier 3: Impact needs analysis. The outcome may affect behavior beyond the obvious edit, but the scope appears bounded enough for one structured HOLMES pass to close the unknowns. This includes creative deliverables requiring deep project understanding or multi-source synthesis. Complete Hone, Observe, Ladder, Map, Establish, and Synthesize before mutation.",
   "",
-  "Tier 4: Potentially cascading impact. The outcome may propagate across systems, safety-critical surfaces, architecture, data, deployment, public contracts, security/auth, or unresolved unknowns. Iterate HOLMES passes until blockers close, impact is bounded, and a concrete mutation scope is synthesized.",
+  "Tier 4: Potentially cascading impact. The outcome may propagate across systems, safety-critical surfaces, architecture, data, deployment, public contracts, security/auth, public-facing deliverables, reputational risk, multi-agent coordination, unknown project context, or unresolved unknowns. Iterate HOLMES passes until blockers close, impact is bounded, and a concrete mutation scope is synthesized.",
   "",
   "## Prove-down rule",
   "",
@@ -29,6 +29,17 @@ export const HOLMES_SYSTEM_PROMPT = [
   "",
   "If the request is plausibly simple but impact is not yet provable, gather the minimal read-only evidence needed before calling `holmes_classify`. Do not mutate before classification.",
   "",
+  "Warning: switching to read-only tools does not lower impact when the requested outcome still depends on synthesis, judgment, external claims, coordination, or artifact creation.",
+  "",
+  "## Non-code impact surfaces",
+  "",
+  "- Factual accuracy/source grounding: claims must trace to user-provided facts, files, tools, or cited sources.",
+  "- Human audience: advice, instructions, narratives, and decisions can change user behavior even without code mutation.",
+  "- Reputation/public representation: public-facing text, release notes, marketing, statements of position, or customer-visible artifacts carry reputational risk.",
+  "- Creative quality: creative deliverables can fail through poor fit, weak voice, missing constraints, or shallow project understanding.",
+  "- Coordination/multi-agent cascade: plans, delegation, scope decisions, and agent instructions can amplify an incorrect assumption across sessions.",
+  "- Session artifacts: generated files, local notes, `local://` plans, or durable summaries can steer later work and must match their intended audience and evidence level.",
+  "",
   "## How to call `holmes_classify`",
   "",
   "Call it before the first mutation with:",
@@ -41,6 +52,7 @@ export const HOLMES_SYSTEM_PROMPT = [
   "  - For `write`: include the exact file content in `structuredEffect.exactContent`.",
   "  - For `ast_edit`: include the exact ops JSON in `structuredEffect.exactOps`.",
   "  - For opaque tools (`bash`, `eval`, `task`, etc.): include the exact command/code in `exactOpaqueInput`.",
+  "  - For creative/session outcomes: identify the outcome kind (`creative_writing`, `research_synthesis`, `coordination`, or `session_artifact`), cite known inputs, and state whether the call is `scope_only` or will create/update a durable artifact such as `local://...`.",
   "- intended received effect;",
   "- predicted behavior change;",
   "- affected systems/downstream effects if known;",
@@ -111,22 +123,6 @@ export const HOLMES_SYSTEM_PROMPT = [
 export const VERIFY_REMINDER =
   "Verify this change landed correctly: read the affected file and confirm the edit matches your intent.";
 
-export const RESEARCHER_CONTRACT = [
-  "Never modify files.",
-  "Never run formatters, tests, builds, package managers, or project-wide commands.",
-  "Never broaden the assignment into design advice unless the requested fact cannot be separated from a design constraint.",
-  "Never guess from names alone. If evidence is absent, say so and list what was checked.",
-  "Keep scope tight: answer the question asked, plus only the adjacent facts needed to make the answer safe to use.",
-].join("\n");
-
-export const VERIFIER_CONTRACT = [
-  "Never edit files.",
-  "Never reimplement the solution.",
-  "Never run formatters or broad project-wide gates unless the parent explicitly asks for that exact command.",
-  "Run only targeted tests or checks that are provided, clearly implied by the changed files, or necessary to prove the stated acceptance criteria.",
-  "Treat missing tests as a verification gap, not a pass.",
-  "Do not ignore failures. Report the failing command, relevant output, and the criterion it blocks.",
-].join("\n");
 
 export function buildHolmesPrompt(args: string): string {
   const context = args.trim() || "the current task";
