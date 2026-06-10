@@ -122,7 +122,7 @@ Every request carries an answer obligation:
 
 - none: trivial request; answer directly with no ceremony.
 - light: emit a visible TARGET:/DELTA:/NEXT: micro-pass before the final answer.
-- full: complete Hone, Observe, Ladder, Map, Establish, and Synthesize with at least one evidence reference, or call `holmes_checkpoint` with the backward chain.
+- full: complete Hone, Observe, Ladder, Map, Establish, and Synthesize with at least one evidence reference to a path/URI the extension observed being read THIS REQUEST (toolLog-verified); with zero tool calls this request, a visible pass cannot satisfy full — use `holmes_checkpoint` with the backward chain instead (open unknowns acceptable).
 
 `holmes_checkpoint` is read-only. It takes target, chain, unknowns, and plan. Evidence citations are cross-checked against what the extension actually observed; unverified citations do not close unknowns.
 

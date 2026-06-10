@@ -208,6 +208,7 @@ export interface ReasoningGraderOutcome {
   verdict?: "coherent" | "hollow" | "incoherent";
   defectAxes: string[];
   cached: boolean;
+  advisories?: string[];
 }
 
 export type ImpactSignalKind =
@@ -549,6 +550,7 @@ export interface ToolCallSummary {
   inspectable: boolean;
   allowed?: boolean;
   blockedReason?: string;
+  failed?: boolean;
   timestampMs: number;
 }
 

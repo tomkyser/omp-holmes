@@ -10,7 +10,11 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
 } from "@oh-my-pi/pi-coding-agent";
-import holmes from "./main";
+import holmes, {
+  HOLMES_GRADE_MUTATION_PASSES_FLAG,
+  HOLMES_GRADER_TIMEOUT_MS_FLAG,
+  resolveHolmesConfig,
+} from "./main";
 import {
   assessImpactTier,
   buildHolmesClassifyParamsSchema,
@@ -21,6 +25,7 @@ import {
   stableHashText,
   summarizePendingEffect,
   updateClassificationComplianceFromObservation,
+  updateToolResultLog,
   updateVerificationOutcome,
 } from "./classification";
 import {
@@ -48,6 +53,7 @@ import {
   createDelegationState,
   createObservationState,
   createStats,
+  DEFAULT_GRADER_TIMEOUT_MS,
   type ClassificationProcessState,
   type ClassificationRecord,
   type EvidenceRef,
@@ -2771,6 +2777,22 @@ describe("HOLMES mutation-path reasoning grading flag", () => {
     };
   }
 
+  test("registered extension flags flip mutation grading config and preserve defaults", () => {
+    const defaults = resolveHolmesConfig({ getFlag: () => undefined });
+    expect(defaults.gradeMutationPasses).toBe(false);
+    expect(defaults.graderTimeoutMs).toBe(DEFAULT_GRADER_TIMEOUT_MS);
+
+    const flipped = resolveHolmesConfig({
+      getFlag: (name) => {
+        if (name === HOLMES_GRADE_MUTATION_PASSES_FLAG) return true;
+        if (name === HOLMES_GRADER_TIMEOUT_MS_FLAG) return "9000";
+        return undefined;
+      },
+    });
+    expect(flipped.gradeMutationPasses).toBe(true);
+    expect(flipped.graderTimeoutMs).toBe(8_000);
+  });
+
   test("gradeMutationPasses absent is behaviorally inert for representative gate outcomes", async () => {
     let graderCalls = 0;
     const leakingGrader: ReasoningGraderAssessor = async (packet) => {
@@ -2832,6 +2854,41 @@ describe("HOLMES mutation-path reasoning grading flag", () => {
     expect(stats.graderCalls).toBe(1);
   });
 
+  test("failed mutation-path grader assessments are not cached", async () => {
+    const observation = observeVisible(tier4PassText());
+    const graderCache = new Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>();
+    const graderCallsByRequestDigest = new Map<string, number>();
+    let graderCalls = 0;
+    const failedGrader: ReasoningGraderAssessor = async () => {
+      graderCalls++;
+      return {
+        status: "failed",
+        defects: [],
+        requiredAdditions: [],
+      };
+    };
+
+    await gateAfterCompliance({
+      tier: 4,
+      observation,
+      gradeMutationPasses: true,
+      grader: failedGrader,
+      graderCache,
+      graderCallsByRequestDigest,
+    });
+    await gateAfterCompliance({
+      tier: 4,
+      observation,
+      gradeMutationPasses: true,
+      grader: failedGrader,
+      graderCache,
+      graderCallsByRequestDigest,
+    });
+
+    expect(graderCalls).toBe(2);
+    expect(graderCache.size).toBe(0);
+  });
+
   test("valid-citation hollow grader defect raises one axis then cap-converts to advisory", async () => {
     const state = createMockClassificationState({ sequence: 2 });
     const event = editCall();
@@ -2890,6 +2947,44 @@ describe("HOLMES mutation-path reasoning grading flag", () => {
     expect(stats.reasoningSoftViolations).toBe(1);
     expect(graderCallsByRequestDigest.get(REQUEST_DIGEST)).toBe(2);
     expect(handleClassificationGate({ ...gateArgs(event, state, secondObservation, toolLog), event })).toBeUndefined();
+  });
+
+  test("gradeMutationPasses false is behaviorally inert for representative gate outcomes", async () => {
+    // RT: TestQuality explicit gradeMutationPasses false.
+    let graderCalls = 0;
+    const leakingGrader: ReasoningGraderAssessor = async (packet) => {
+      graderCalls++;
+      return {
+        status: "succeeded",
+        verdict: "hollow",
+        defects: [{
+          axis: "chain",
+          severity: "high",
+          detail: "chain is hollow",
+          citedEvidence: [packet.facts.verifiedEvidenceIds[0] ?? "missing-evidence"],
+        }],
+        requiredAdditions: ["chain"],
+      };
+    };
+    const cases = [
+      { tier: 2 as HolmesTier, observation: observeVisible("TARGET: README.md typo\nDELTA: edit README.md only\nNEXT: verify by read-back.") },
+      { tier: 3 as HolmesTier, observation: observeVisible(tier3PassText) },
+      { tier: 4 as HolmesTier, observation: observeVisible(tier4PassText()) },
+    ];
+
+    for (const item of cases) {
+      const baseline = await gateAfterCompliance(item);
+      const withExplicitFalse = await gateAfterCompliance({
+        ...item,
+        gradeMutationPasses: false,
+        grader: leakingGrader,
+        stats: createStats(),
+        graderCache: new Map<string, Awaited<ReturnType<ReasoningGraderAssessor>>>(),
+        graderCallsByRequestDigest: new Map<string, number>(),
+      });
+      expect(withExplicitFalse.result?.block === true).toBe(baseline.result?.block === true);
+    }
+    expect(graderCalls).toBe(0);
   });
 });
 
@@ -2967,6 +3062,21 @@ describe("HOLMES answer gate integration", () => {
   function readCall(path = "README.md", toolCallId = "read-1"): ToolCall {
     return toolCall("read", { path }, toolCallId);
   }
+
+  test("failed tool results mark the original attempt in the digest bucket", () => {
+    const state = createMockClassificationState();
+    const toolLog = createToolLog();
+    const event = readCall("README.md", "failed-read");
+    handleClassificationGate({
+      ...gateArgs(event, state, createObservationState(1), toolLog),
+      event,
+    });
+
+    updateToolResultLog(toolLog, { toolCallId: "failed-read", isError: true });
+
+    expect(toolLog.currentTurn[0]?.failed).toBe(true);
+    expect(toolLog.byUserRequestDigest.get(REQUEST_DIGEST)?.[0]?.failed).toBe(true);
+  });
 
   function agentEnd() {
     return { type: "agent_end", messages: [] };
@@ -3174,5 +3284,501 @@ describe("HOLMES answer gate integration", () => {
     const status = await runtimeStatusText(throwing.mock);
     expect(statusCounter(status, "Answer soft accepts")).toBe(1);
     expect(statusCounter(status, "Reasoning soft violations")).toBe(1);
+  });
+
+  test("never-blocked tools bypass primitive and delegation blocks while registered checkpoint executes", async () => {
+    // RT: Phase B never-blocked exit criterion.
+    const HOLMES_CHECKPOINT_TOOL = "holmes_checkpoint";
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("never-blocked pass-through")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+
+    const blockedDelegation = mock.invoke(
+      "tool_call",
+      toolCall("task", { agent: "holmes-researcher", tasks: [{ assignment: "HOLMES researcher contract" }] }, "blocked-task"),
+    );
+    expect(blockedDelegation?.block).toBe(true);
+
+    expect(mock.invoke("tool_call", readCall("src/never-blocked-0.ts", "read-burst-0"))).toBeUndefined();
+    expect(mock.invoke("tool_call", readCall("src/never-blocked-1.ts", "read-burst-1"))).toBeUndefined();
+    expect(mock.invoke("tool_call", readCall("src/never-blocked-2.ts", "read-burst-2"))).toBeUndefined();
+    expect(mock.invoke("tool_call", readCall("src/never-blocked-3.ts", "read-burst-3"))).toBeUndefined();
+    expect(mock.invoke("tool_call", readCall("src/never-blocked-4.ts", "read-burst-4"))?.block).toBe(true);
+
+    expect(
+      mock.invoke(
+        "tool_call",
+        toolCall(HOLMES_CHECKPOINT_TOOL, { target: "pass through despite guards" }, "checkpoint-pass-through"),
+      ),
+    ).toBeUndefined();
+    expect(
+      mock.invoke(
+        "tool_call",
+        toolCall(HOLMES_CLASSIFY_TOOL, { proposedTier: 4 }, "classify-pass-through"),
+      ),
+    ).toBeUndefined();
+
+    const before = await runtimeStatusText(mock);
+    const checkpointTool = mock.tools.get(HOLMES_CHECKPOINT_TOOL);
+    expect(checkpointTool).toBeDefined();
+    const result = await checkpointTool.execute(
+      "checkpoint-exec",
+      {
+        target: "Answer the request from extension-observed evidence only.",
+        chain: [{ step: "The answer scope depends on the file read this request.", evidence: ["src/never-blocked-0.ts"] }],
+        unknowns: [{ question: "Is additional source needed?", status: "open" }],
+        plan: ["Return the answer without mutation."],
+      },
+      new AbortController().signal,
+      undefined,
+      mock.ctx,
+    );
+
+    const verdict = result.content?.[0]?.text;
+    expect(typeof verdict).toBe("string");
+    expect(verdict).toContain("checkpoint_tool");
+    const after = await runtimeStatusText(mock);
+    expect(statusCounter(after, "Answer checkpoints satisfied")).toBe(statusCounter(before, "Answer checkpoints satisfied") + 1);
+  });
+
+  test("redacts self-classification section theater before satisfying the answer gate", async () => {
+    // RT: TestQuality P2 redaction bite.
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("redaction bite")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    expect(mock.invoke("tool_call", readCall("README.md", "read-redaction"))).toBeUndefined();
+    const selfClassificationOnlyPass = [
+      "Hone: [CLASSIFY: Tier 4] answer this migration from inspected files only.",
+      "Observe: [CLASSIFY: Tier 4] README.md was inspected at ¶README.md#READ1.",
+      "Ladder: [CLASSIFY: Tier 4] the observed evidence bounds the answer.",
+      "Map: [CLASSIFY: Tier 4] scope remains read-only and file-bound.",
+      "Establish: [CLASSIFY: Tier 4] closure cites ¶README.md#READ1.",
+      "Synthesize: [CLASSIFY: Tier 4] the final answer uses ¶README.md#READ1 without mutation.",
+    ].join("\n");
+
+    await endAssistantMessage(mock, selfClassificationOnlyPass);
+    invokeAgentEndNoThrow(mock);
+
+    const demand = expectNextTurnDemand(mock);
+    expect(demand).toContain("backward_chain_sections");
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer checkpoints satisfied")).toBe(0);
+  });
+
+  test("answer demand retry is consumed once before soft accept", async () => {
+    // RT: TestQuality retriesUsed consumption.
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("retry consumption")));
+
+    invokeAgentEndNoThrow(mock);
+    expectNextTurnDemand(mock);
+    invokeAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer demands issued")).toBe(1);
+    expect(statusCounter(status, "Answer soft accepts")).toBe(1);
+    expect(statusCounter(status, "Reasoning soft violations")).toBe(1);
+  });
+
+  test("new request digest rearms the answer demand after soft accept", async () => {
+    // RT: TestQuality digest-change re-arm.
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("digest rearm first")));
+    invokeAgentEndNoThrow(mock);
+    expectNextTurnDemand(mock, 0);
+    invokeAgentEndNoThrow(mock);
+
+    mock.invoke("context", userContext(fullRequest("digest rearm second")));
+    invokeAgentEndNoThrow(mock);
+
+    expectNextTurnDemand(mock, 1);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer demands issued")).toBe(2);
+    expect(statusCounter(status, "Answer soft accepts")).toBe(1);
+  });
+
+  test("read-only-escape regression records exactly one answer demand", async () => {
+    // RT: TestQuality read-only escape stats.
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("read-only escape stats")));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    expect(mock.invoke("tool_call", readCall())).toBeUndefined();
+
+    await endAssistantMessage(mock, substantiveNoPassAnswer);
+    invokeAgentEndNoThrow(mock);
+
+    expectNextTurnDemand(mock);
+    const status = await runtimeStatusText(mock);
+    expect(statusCounter(status, "Answer demands issued")).toBe(1);
+  });
+
+  test("checkpoint demand contains no canned pass exemplar", async () => {
+    // RT: I9 demand exemplar hardening.
+    const { mock } = createAnswerGateMock();
+    mock.invoke("context", userContext(fullRequest("demand exemplar hardening")));
+
+    invokeAgentEndNoThrow(mock);
+
+    const demand = expectNextTurnDemand(mock);
+    expect(demand).not.toContain("TARGET: <");
+    for (const line of fullPass().split("\n")) {
+      expect(demand).not.toContain(line);
+    }
+  });
+});
+
+describe("HOLMES red-team factory regressions", () => {
+  const HOLMES_CHECKPOINT_TOOL = "holmes_checkpoint";
+  const digestCollisionRequest = "ok?";
+  const alternateDigestRequest = "different short request.";
+  const staleEvidencePath = "src/request-a-only.ts";
+  const coherentGrade = JSON.stringify({
+    status: "succeeded",
+    verdict: "coherent",
+    defects: [],
+    requiredAdditions: [],
+  });
+
+  type MockHolmesApi = ReturnType<typeof createMockExtensionAPI>;
+  type MockGraderRequest = { messages: Array<{ content: string }> };
+  function redTeamCreateMock(): MockHolmesApi {
+    const mock = createMockExtensionAPI();
+    (mock.ctx.ui as typeof mock.ctx.ui & { setStatus(name: string, status: string): void }).setStatus = () => {};
+    return mock;
+  }
+
+
+  function redTeamContext(text: string) {
+    return {
+      type: "context",
+      messages: [{ role: "user", content: [{ type: "text", text }] }],
+    };
+  }
+
+  function redTeamAgentEnd() {
+    return { type: "agent_end", messages: [] };
+  }
+
+  async function redTeamEndMessage(mock: MockHolmesApi, text: string) {
+    await mock.invoke("message_end", mockMessageEnd([{ type: "text", text }]));
+  }
+
+  async function redTeamAgentEndNoThrow(mock: MockHolmesApi) {
+    await expect(Promise.resolve(mock.invoke("agent_end", redTeamAgentEnd()))).resolves.toBeUndefined();
+  }
+
+  function redTeamDemand(mock: MockHolmesApi, index = 0): string {
+    expect(mock.sentMessages).toHaveLength(index + 1);
+    const [message, options] = mock.sentMessages[index] as [
+      { customType?: unknown; display?: unknown; content?: unknown },
+      unknown,
+    ];
+    expect(options).toEqual({ deliverAs: "nextTurn", triggerTurn: true });
+    expect(message.customType).toBe("holmes_answer_checkpoint");
+    expect(message.display).toBe(true);
+    expect(typeof message.content).toBe("string");
+    return message.content as string;
+  }
+
+  async function redTeamStatusText(mock: MockHolmesApi): Promise<string> {
+    await mock.commands.get("holmes-status").handler("", mock.ctx);
+    return mock.notifications.at(-1)?.text ?? "";
+  }
+
+  function redTeamStatusCounter(status: string, label: string): number {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = status.match(new RegExp(`${escaped}:\\s+(\\d+)`));
+    expect(match).not.toBeNull();
+    return Number(match![1]);
+  }
+
+  function redTeamFullPass(path: string, evidenceId: string, repair = "complete"): string {
+    return [
+      `Hone: answer the request using only extension-observed evidence for ${path}.`,
+      `Observe: ${path} was inspected at ¶${path}#${evidenceId}.`,
+      "Ladder: the observed evidence bounds the answer and no unverified file state is used.",
+      "Map: scope remains read-only for the answer; no edit, write, or shell mutation is part of this response.",
+      `Establish: closure is tied to ¶${path}#${evidenceId} and unresolved items stay explicit.`,
+      `Synthesize: ${repair} answer uses ¶${path}#${evidenceId} to close the reasoning chain without mutation.`,
+    ].join("\n");
+  }
+
+  function redTeamTier4Pass(path: string, evidenceId: string): string {
+    return [
+      `Hone: target is ${path} only.`,
+      `Observe: current ${path} was inspected at ¶${path}#${evidenceId}.`,
+      "Ladder: Tier 4 closure is now a fixed-point; all blocking unknowns closed.",
+      `Map: cumulative scope remains ${path} using edit only.`,
+      `Establish: verify by read-back of ${path}.`,
+      `Synthesize: fixed-point closure reached; all blocking unknowns closed; scope remains ${path} under the approved edit lease; blocked-effect ledger reviewed; verification plan is ${path} read-back.`,
+    ].join("\n");
+  }
+
+  function redTeamLightPass(path: string): string {
+    return [
+      `TARGET: answer from ${path}.`,
+      `DELTA: keep the response bounded to ${path}.`,
+      `NEXT: cite verified ${path} evidence if a full answer is required.`,
+    ].join("\n");
+  }
+
+  function redTeamToolResult(
+    toolName: string,
+    toolCallId: string,
+    input: Record<string, unknown>,
+    isError: boolean,
+  ): ToolResultEvent {
+    return {
+      type: "tool_result",
+      toolCallId,
+      toolName,
+      input,
+      content: [{ type: "text", text: isError ? "tool failed" : "ok" }],
+      isError,
+      details: undefined,
+    };
+  }
+
+  function redTeamRead(mock: MockHolmesApi, path: string, toolCallId: string, isError = false) {
+    expect(mock.invoke("tool_call", toolCall("read", { path }, toolCallId))).toBeUndefined();
+    mock.invoke("tool_result", redTeamToolResult("read", toolCallId, { path }, isError));
+  }
+
+  async function redTeamCheckpoint(mock: MockHolmesApi, toolCallId: string) {
+    const params = {
+      target: "Answer the request from extension-observed facts.",
+      chain: [{ step: "The answer is bounded by the current request." }],
+      unknowns: [],
+      plan: ["Return the answer without mutation."],
+    };
+    expect(mock.invoke("tool_call", toolCall(HOLMES_CHECKPOINT_TOOL, params, toolCallId))).toBeUndefined();
+    const tool = mock.tools.get(HOLMES_CHECKPOINT_TOOL);
+    expect(tool).toBeDefined();
+    return await tool.execute(toolCallId, params, new AbortController().signal, undefined, mock.ctx);
+  }
+
+  async function redTeamSeedLiveTierRecord(mock: MockHolmesApi, tier: 3 | 4, toolCallId: string) {
+    const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
+    expect(tool).toBeDefined();
+    const result = await withDocFixture((cwd) =>
+      tool.execute(
+        toolCallId,
+        docFixtureParams({
+          proposedTier: tier,
+          reasoning: `Tier ${tier} fixture classification for a bounded docs change; HOLMES pass required before mutation.`,
+          holmes: {
+            target: "Fix docs fixture typo only.",
+            now: `${DOC_FIXTURE_PATH} is a docs prose file; one misspelled plain text word is identified.`,
+            delta: "Replace misspelled prose with corrected prose.",
+            next: `Apply the exact ${DOC_FIXTURE_PATH} edit, then verify by read-back.`,
+            knownFacts: [`${DOC_FIXTURE_PATH} is documentation prose.`],
+            assumptions: [],
+            unknowns: [],
+          },
+        }),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
+    );
+    expect(result.details?.tier).toBeGreaterThanOrEqual(tier);
+  }
+
+  function packetLevel(packetText: string): string {
+    const parsed: unknown = JSON.parse(packetText);
+    if (!parsed || typeof parsed !== "object" || !("facts" in parsed)) return "";
+    const facts = (parsed as { facts?: { level?: unknown } }).facts;
+    return typeof facts?.level === "string" ? facts.level : "";
+  }
+
+  function firstVerifiedEvidenceId(packetText: string): string {
+    const parsed: unknown = JSON.parse(packetText);
+    if (!parsed || typeof parsed !== "object" || !("facts" in parsed)) return "";
+    const facts = (parsed as { facts?: { verifiedEvidenceIds?: unknown } }).facts;
+    const ids = facts?.verifiedEvidenceIds;
+    return Array.isArray(ids) && typeof ids[0] === "string" ? ids[0] : "";
+  }
+
+  function hollowMutationGrade(packetText: string): string {
+    const evidenceId = firstVerifiedEvidenceId(packetText);
+    return JSON.stringify({
+      status: "succeeded",
+      verdict: "hollow",
+      defects: [{
+        axis: "chain",
+        severity: "high",
+        detail: "chain is hollow",
+        citedEvidence: evidenceId ? [evidenceId] : [],
+      }],
+      requiredAdditions: ["chain"],
+    });
+  }
+
+  async function runMutationFlagCase(flagName: string, flagValue: boolean | string | undefined) {
+    const mock = redTeamCreateMock();
+    const flags = new Map<string, boolean | string>();
+    const levels: string[] = [];
+    if (flagValue !== undefined) flags.set(flagName, flagValue);
+    (mock.pi as typeof mock.pi & { getFlag(name: string): boolean | string | undefined }).getFlag = (name) =>
+      flags.get(name);
+    (mock.ctx as typeof mock.ctx & { callModel(request: MockGraderRequest): string }).callModel = (request) => {
+      const content = request.messages[0]?.content ?? "";
+      const level = packetLevel(content);
+      levels.push(level);
+      return level === "tier4_pass" ? hollowMutationGrade(content) : coherentGrade;
+    };
+    holmes(mock.pi);
+    mock.invoke("context", redTeamContext(DOC_FIXTURE_REQUEST));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    const readId = flagValue === undefined ? "config-read-absent" : "config-read-enabled";
+    redTeamRead(mock, DOC_FIXTURE_PATH, readId);
+    await redTeamSeedLiveTierRecord(mock, 4, flagValue === undefined ? "config-classify-absent" : "config-classify-enabled");
+    await redTeamEndMessage(mock, redTeamTier4Pass(DOC_FIXTURE_PATH, "C0DE"));
+    const editResult = mock.invoke(
+      "tool_call",
+      editCall(DOC_FIXTURE_PATCH, flagValue === undefined ? "config-edit-absent" : "config-edit-enabled"),
+    );
+    return {
+      mutationGraderCalls: levels.filter((level) => level === "tier4_pass").length,
+      editBlocked: editResult?.block === true,
+      editReason: typeof editResult?.reason === "string" ? editResult.reason : "",
+    };
+  }
+
+  function markdownSection(source: string, heading: string): string {
+    const lines = source.replace(/\r\n/g, "\n").split("\n");
+    const start = lines.findIndex((line) => line.trim() === heading);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const level = heading.match(/^#+/u)?.[0].length ?? 1;
+    let end = lines.length;
+    for (let index = start + 1; index < lines.length; index++) {
+      const match = /^(#{1,6})\s+\S/u.exec(lines[index]);
+      if (match && match[1].length <= level) {
+        end = index;
+        break;
+      }
+    }
+    return lines.slice(start, end).join("\n").trimEnd();
+  }
+
+  test("checkpoint-first bypass reopens when later facts require full", async () => {
+    // RT: checkpoint-first bypass.
+    const mock = redTeamCreateMock();
+    holmes(mock.pi);
+    mock.invoke("context", redTeamContext("Please review this regex behavior."));
+
+    const checkpoint = await redTeamCheckpoint(mock, "checkpoint-first-light");
+    expect(checkpoint.content?.[0]?.text).toContain("satisfied");
+    let status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+
+    await redTeamSeedLiveTierRecord(mock, 3, "checkpoint-first-tier3");
+    await redTeamEndMessage(mock, "The answer remains read-only, but this turn has not emitted a full HOLMES pass.");
+    await redTeamAgentEndNoThrow(mock);
+
+    const demand = redTeamDemand(mock);
+    expect(demand).toContain("level `full`");
+    expect(demand).toContain("backward_chain_sections");
+
+    await redTeamEndMessage(mock, redTeamLightPass("README.md"));
+    status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+
+    redTeamRead(mock, "README.md", "checkpoint-first-read");
+    await redTeamEndMessage(mock, redTeamFullPass("README.md", "checkpoint-first-read", "reopened full"));
+    await redTeamAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(2);
+  });
+
+  test("digest-collision tool log hygiene keeps fresh matching text isolated", async () => {
+    // RT: toolLog digest hygiene.
+    const mock = redTeamCreateMock();
+    holmes(mock.pi);
+    mock.invoke("context", redTeamContext(digestCollisionRequest));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    for (let index = 0; index < 3; index++) {
+      redTeamRead(mock, index === 0 ? staleEvidencePath : `src/request-a-${index}.ts`, `digest-a-read-${index}`);
+    }
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
+    for (let index = 3; index < 6; index++) {
+      redTeamRead(mock, `src/request-a-${index}.ts`, `digest-a-read-${index}`);
+    }
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 3 });
+    for (let index = 6; index < 8; index++) {
+      redTeamRead(mock, `src/request-a-${index}.ts`, `digest-a-read-${index}`);
+    }
+    await redTeamEndMessage(mock, redTeamFullPass(staleEvidencePath, "digest-a-read-0", "request A"));
+    await redTeamAgentEndNoThrow(mock);
+    let status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+
+    mock.invoke("context", redTeamContext(alternateDigestRequest));
+    mock.invoke("context", redTeamContext(digestCollisionRequest));
+    await redTeamEndMessage(mock, "ok.");
+    await redTeamAgentEndNoThrow(mock);
+    expect(mock.sentMessages).toHaveLength(0);
+
+    await redTeamSeedLiveTierRecord(mock, 3, "digest-collision-tier3");
+    await redTeamEndMessage(mock, redTeamFullPass(staleEvidencePath, "digest-a-read-0", "stale citation"));
+    await redTeamAgentEndNoThrow(mock);
+
+    const demand = redTeamDemand(mock);
+    expect(demand).toContain("verified_evidence");
+    status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+  });
+
+  test("failed read attempts do not verify full-answer evidence", async () => {
+    // RT: failed attempts are not evidence.
+    const mock = redTeamCreateMock();
+    holmes(mock.pi);
+    const path = "src/failed-evidence.ts";
+    mock.invoke("context", redTeamContext("Please debug and design the read-only answer strategy for failed evidence."));
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
+    redTeamRead(mock, path, "failed-evidence-read", true);
+
+    await redTeamEndMessage(mock, redTeamFullPass(path, "failed-evidence-read", "failed read"));
+    await redTeamAgentEndNoThrow(mock);
+
+    const demand = redTeamDemand(mock);
+    expect(demand).toContain("verified_evidence");
+
+    mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
+    redTeamRead(mock, path, "successful-evidence-read");
+    await redTeamEndMessage(mock, redTeamFullPass(path, "successful-evidence-read", "successful read"));
+    await redTeamAgentEndNoThrow(mock);
+
+    expect(mock.sentMessages).toHaveLength(1);
+    const status = await redTeamStatusText(mock);
+    expect(redTeamStatusCounter(status, "Answer checkpoints satisfied")).toBe(1);
+  });
+
+  test("rendered answer protocol stays byte-identical to APPEND_SYSTEM", async () => {
+    // RT: prompt parity drift.
+    const { readFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const { HOLMES_SYSTEM_PROMPT } = await import("./prompts");
+    const appendSystem = readFileSync(join(import.meta.dir, "..", "APPEND_SYSTEM.md"), "utf8");
+
+    expect(markdownSection(HOLMES_SYSTEM_PROMPT, "## Answer protocol")).toBe(
+      markdownSection(appendSystem, "## Answer protocol"),
+    );
+  });
+
+  test("registered config flag enables mutation-pass grading and absence leaves it off", async () => {
+    // RT: config surface.
+    const { HOLMES_GRADE_MUTATION_PASSES_FLAG } = await import("./main");
+
+    const absent = await runMutationFlagCase(HOLMES_GRADE_MUTATION_PASSES_FLAG, undefined);
+    expect(absent).toEqual({ mutationGraderCalls: 0, editBlocked: false, editReason: "" });
+
+    const enabled = await runMutationFlagCase(HOLMES_GRADE_MUTATION_PASSES_FLAG, " true ");
+    expect(enabled.mutationGraderCalls).toBe(1);
+    expect(enabled.editBlocked).toBe(true);
+    expect(enabled.editReason).toMatch(/chain/);
   });
 });

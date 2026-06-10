@@ -5,6 +5,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import {
   DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_REPEATED_BLOCK_LIMIT,
+  HOLMES_CHECKPOINT_TOOL,
   HOLMES_CLASSIFY_TOOL,
   HOLMES_RULE_VERSION,
   MAX_CLASSIFIER_FILE_BYTES,
@@ -4468,6 +4469,8 @@ export async function updateClassificationComplianceFromObservation(args: {
       level: graderLevel,
       observation: args.observation,
       toolLog: args.toolLog,
+      requestDigest: record.userRequestDigest,
+      requestText: args.classification.latestUserRequest,
       lease: record.lease,
     });
     const cacheKey = `${record.userRequestDigest}\0${graderCacheKey(packet)}`;
@@ -4493,7 +4496,7 @@ export async function updateClassificationComplianceFromObservation(args: {
       } catch {
         continue;
       }
-      cache.set(cacheKey, assessment);
+      if (assessment.status === "succeeded") cache.set(cacheKey, assessment);
     }
 
     if (assessment.status !== "succeeded") continue;
@@ -4536,15 +4539,21 @@ export async function updateClassificationComplianceFromObservation(args: {
 }
 
 export function updateToolResultLog(toolLog: HolmesToolCallLog, event: { toolCallId?: string; isError?: boolean }): void {
-  const summary = [...toolLog.currentTurn].reverse().find(call => call.toolCallId === event.toolCallId);
-  if (summary && event.isError) summary.blockedReason = "tool_result_error";
+  if (!event.isError || !event.toolCallId) return;
+  for (let index = toolLog.currentTurn.length - 1; index >= 0; index--) {
+    const summary = toolLog.currentTurn[index];
+    if (summary.toolCallId !== event.toolCallId) continue;
+    summary.failed = true;
+    summary.blockedReason = "tool_result_error";
+    return;
+  }
 }
 
 export function updateVerificationOutcome(
   state: HolmesClassificationState,
   event: { toolName: string; toolCallId?: string; isError?: boolean; input?: unknown },
 ): void {
-  if (event.toolName === HOLMES_CLASSIFY_TOOL) return;
+  if (event.toolName === HOLMES_CLASSIFY_TOOL || event.toolName === HOLMES_CHECKPOINT_TOOL) return;
   if (event.isError) {
     const ledger = ensureLedger(state, state.latestUserRequestDigest);
     const key = `${event.toolName}:${event.toolCallId ?? "unknown"}`;
@@ -4596,7 +4605,7 @@ function verificationRecoveryGuidance(ledger: CumulativeScopeLedger | undefined)
 }
 
 function isVerificationCapableTool(toolName: string): boolean {
-  if (toolName === HOLMES_CLASSIFY_TOOL) return false;
+  if (toolName === HOLMES_CLASSIFY_TOOL || toolName === HOLMES_CHECKPOINT_TOOL) return false;
   return VERIFY_TOOLS.has(toolName) || READ_ONLY_TOOLS.has(toolName);
 }
 

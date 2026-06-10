@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import {
+  DEFAULT_GRADER_TIMEOUT_MS,
   DEFAULT_REPEATED_BLOCK_LIMIT,
   HOLMES_CHECKPOINT_TOOL,
   HOLMES_CLASSIFY_TOOL,
@@ -16,8 +17,11 @@ import type {
   AnswerGateState,
   HolmesCheckpointParams,
   HolmesStats,
-  MessageObservationState,
   PrimitiveBurstState,
+  HolmesConfig,
+  HolmesToolCallLog,
+  MessageObservationState,
+  ReasoningGraderAssessment,
 } from "./types";
 import {
   hasVisibleClassification,
@@ -43,10 +47,12 @@ import {
   processAnswerMessageEnd,
   triageAnswerObligation,
 } from "./answer";
+import type { ReasoningGraderRuntime } from "./answer";
 import {
   createExtensionOwnedReasoningGrader,
+  createReasoningGraderRequestCache,
 } from "./grader";
-import type { ReasoningGraderAssessor } from "./grader";
+import type { ReasoningGraderAssessor, ReasoningGraderRequestCache } from "./grader";
 import type {
   HolmesToolCallEvent,
   HolmesToolResultEvent,
@@ -67,6 +73,8 @@ import {
 } from "./prompts";
 
 export default function holmes(pi: ExtensionAPI): void {
+  registerHolmesConfigFlags(pi);
+  const resolveRuntimeConfig = (): HolmesConfig => resolveHolmesConfig(pi);
   const primitiveState: PrimitiveBurstState = { burst: 0 };
   const classificationState = createClassificationState();
   const turn = createTurnMetadata();
@@ -78,7 +86,12 @@ export default function holmes(pi: ExtensionAPI): void {
   const sendMessage = pi.sendMessage.bind(pi) as ExtensionAPI["sendMessage"];
   let grader: ReasoningGraderAssessor | undefined;
   const ensureReasoningGrader = (ctx: ExtensionContext): ReasoningGraderAssessor | undefined => {
-    grader ??= createExtensionOwnedReasoningGrader({ pi, ctx });
+    const config = resolveRuntimeConfig();
+    grader ??= createExtensionOwnedReasoningGrader({
+      pi,
+      ctx,
+      timeoutMs: config.graderTimeoutMs,
+    });
     return grader;
   };
   const hasLiveTier34ClassificationRecord = (requestDigest: string): boolean =>
@@ -87,6 +100,47 @@ export default function holmes(pi: ExtensionAPI): void {
       record.userRequestDigest === requestDigest &&
       record.tier >= 3
     );
+  const answerGraderCachesByRequest = new Map<string, ReasoningGraderRequestCache>();
+  const mutationPassGraderCache = new Map<string, ReasoningGraderAssessment>();
+  const graderCallsByRequestDigest = new Map<string, number>();
+  const answerGraderCacheForRequest = (requestDigest: string): ReasoningGraderRequestCache => {
+    const existing = answerGraderCachesByRequest.get(requestDigest);
+    if (existing) return existing;
+    const created = createReasoningGraderRequestCache();
+    answerGraderCachesByRequest.set(requestDigest, created);
+    return created;
+  };
+  const graderRuntime: ReasoningGraderRuntime = { cacheForDigest: answerGraderCacheForRequest };
+  const pruneGraderStateForRequest = (requestDigest: string): void => {
+    for (const key of answerGraderCachesByRequest.keys()) {
+      if (key !== requestDigest) answerGraderCachesByRequest.delete(key);
+    }
+    const cacheKeyPrefix = `${requestDigest}\0`;
+    for (const key of mutationPassGraderCache.keys()) {
+      if (!key.startsWith(cacheKeyPrefix)) mutationPassGraderCache.delete(key);
+    }
+    for (const key of graderCallsByRequestDigest.keys()) {
+      if (key !== requestDigest) graderCallsByRequestDigest.delete(key);
+    }
+  };
+  // OMP can deliver agent_end while message_end is still awaiting the answer grader
+  // (P1 race finding), so terminal handling must wait for in-flight answer work.
+  let pendingAnswerWork: Promise<void> | undefined;
+  const pendingAnswerWorks = new Set<Promise<void>>();
+  const refreshPendingAnswerWork = (): void => {
+    pendingAnswerWork = pendingAnswerWorks.size === 0
+      ? undefined
+      : Promise.all(pendingAnswerWorks).then(() => undefined);
+  };
+  const trackPendingAnswerWork = <T>(work: Promise<T>): Promise<T> => {
+    const pending = work.then(() => undefined, () => undefined);
+    pendingAnswerWorks.add(pending);
+    refreshPendingAnswerWork();
+    return work.finally(() => {
+      pendingAnswerWorks.delete(pending);
+      refreshPendingAnswerWork();
+    });
+  };
 
 
   pi.setLabel("HOLMES");
@@ -114,14 +168,17 @@ export default function holmes(pi: ExtensionAPI): void {
     hidden: false,
     defaultInactive: false,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const result = await executeHolmesCheckpoint({
+      const result = await trackPendingAnswerWork(executeHolmesCheckpoint({
         params: params as HolmesCheckpointParams,
         state: answerState,
         observation: observationState,
         toolLog,
         stats,
         grader: ensureReasoningGrader(ctx),
-      });
+        graderRuntime,
+        requestText: classificationState.latestUserRequest,
+        signal: _signal,
+      }));
       return {
         content: [{ type: "text" as const, text: result.content }],
         details: result.record,
@@ -215,14 +272,14 @@ export default function holmes(pi: ExtensionAPI): void {
       classificationState.sequence++;
       classificationState.lastGateBlockByEffect.clear();
       resetRequestLedger(classificationState, digest);
+      pruneGraderStateForRequest(digest);
 
       turn.latestUserRequest = latestUserRequest;
       turn.latestUserRequestDigest = digest;
       turn.turnId = classificationState.turnId;
       turn.startedAtMs = Date.now();
 
-      toolLog.currentTurn = [];
-      toolLog.repeatedBlockCount = 0;
+      resetToolLogForNewRequest(toolLog, digest);
       observationState = createObservationState(classificationState.turnId);
       visibleMarkerCountedForRequest = false;
       resetDelegation(delegationState);
@@ -234,25 +291,23 @@ export default function holmes(pi: ExtensionAPI): void {
         level,
         classificationState.sequence,
       );
-      stats.answerObligationsCreated++;
-      if (answerState.phase === "obligated" || answerState.phase === "awaiting_repair") {
-        const notice = buildObligationContextNotice(answerState);
-        if (notice) {
-          return {
-            messages: [
-              ...event.messages,
-              {
-                role: "user" as const,
-                content: notice,
-                synthetic: true,
-                timestamp: Date.now(),
-              },
-            ],
-          };
-        }
-      }
+      if (level !== "none") stats.answerObligationsCreated++;
     }
 
+    const notice = buildObligationContextNotice(answerState);
+    if (notice) {
+      return {
+        messages: [
+          ...event.messages,
+          {
+            role: "user" as const,
+            content: notice,
+            synthetic: true,
+            timestamp: Date.now(),
+          },
+        ],
+      };
+    }
     return undefined;
   });
 
@@ -277,31 +332,52 @@ export default function holmes(pi: ExtensionAPI): void {
   });
 
   pi.on("message_end", async (event, ctx) => {
-    reconcileObservation(observationState, event);
-    classificationState.sequence++;
-    if (!visibleMarkerCountedForRequest && hasVisibleClassification(observationState)) {
-      visibleMarkerCountedForRequest = true;
-      stats.visibleMarkersObserved++;
-    }
-    await updateClassificationComplianceFromObservation({
-      classification: classificationState,
-      observation: observationState,
-      sequence: classificationState.sequence,
-      delegation: delegationState,
-      toolLog,
-    });
-    await processAnswerMessageEnd({
-      state: answerState,
-      observation: observationState,
-      toolLog,
-      stats,
-      sequence: classificationState.sequence,
-      grader: ensureReasoningGrader(ctx),
-      liveTier34Record: hasLiveTier34ClassificationRecord(answerState.requestDigest),
-    });
+    await trackPendingAnswerWork((async () => {
+      reconcileObservation(observationState, event);
+      classificationState.sequence++;
+      if (!visibleMarkerCountedForRequest && hasVisibleClassification(observationState)) {
+        visibleMarkerCountedForRequest = true;
+        stats.visibleMarkersObserved++;
+      }
+      const config = resolveRuntimeConfig();
+      const reasoningGrader = ensureReasoningGrader(ctx);
+      await updateClassificationComplianceFromObservation({
+        classification: classificationState,
+        observation: observationState,
+        sequence: classificationState.sequence,
+        delegation: delegationState,
+        toolLog,
+        config,
+        stats,
+        grader: reasoningGrader,
+        graderCache: mutationPassGraderCache,
+        graderCallsByRequestDigest,
+      });
+      await processAnswerMessageEnd({
+        state: answerState,
+        observation: observationState,
+        toolLog,
+        stats,
+        sequence: classificationState.sequence,
+        grader: reasoningGrader,
+        graderRuntime,
+        requestText: classificationState.latestUserRequest,
+        liveTier34Record: hasLiveTier34ClassificationRecord(answerState.requestDigest),
+      });
+    })());
   });
 
-  pi.on("agent_end", (_event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
+    for (;;) {
+      const pending = pendingAnswerWork;
+      if (!pending) break;
+      try {
+        await pending;
+      } catch {
+        // message_end/checkpoint owns reporting; agent_end only needs the settled state.
+      }
+      if (pendingAnswerWork === pending) break;
+    }
     handleAgentEnd({
       state: answerState,
       observation: observationState,
@@ -416,4 +492,69 @@ function prefix(value: string): string {
 
 function limitText(value: string): string {
   return value.length <= MAX_SCAN_CHARS ? value : value.slice(0, MAX_SCAN_CHARS);
+}
+
+export const HOLMES_GRADE_MUTATION_PASSES_FLAG = "holmes-grade-mutation-passes";
+export const HOLMES_GRADER_TIMEOUT_MS_FLAG = "holmes-grader-timeout-ms";
+
+const MIN_HOLMES_GRADER_TIMEOUT_MS = 1;
+const MAX_HOLMES_GRADER_TIMEOUT_MS = 8_000;
+
+export interface HolmesConfigFlagReader {
+  getFlag(name: string): boolean | string | undefined;
+}
+
+function registerHolmesConfigFlags(pi: Pick<ExtensionAPI, "registerFlag">): void {
+  // Extension-owned config uses registered CLI flags: ExtensionAPI.registerFlag/getFlag
+  // are the real extension surface in @oh-my-pi/pi-coding-agent 15.10.12
+  // (dist/types/extensibility/extensions/types.d.ts:616-625). ExtensionContext
+  // itself only exposes UI/session/model/cwd/memory (same file:176-205), not
+  // ctx.config/ctx.settings.
+  pi.registerFlag(HOLMES_GRADE_MUTATION_PASSES_FLAG, {
+    description: "Enable HOLMES mutation-pass reasoning grading.",
+    type: "boolean",
+    default: false,
+  });
+  pi.registerFlag(HOLMES_GRADER_TIMEOUT_MS_FLAG, {
+    description: "HOLMES reasoning grader timeout in milliseconds (1..8000).",
+    type: "string",
+    default: String(DEFAULT_GRADER_TIMEOUT_MS),
+  });
+}
+
+export function resolveHolmesConfig(flags: HolmesConfigFlagReader): HolmesConfig {
+  return {
+    gradeMutationPasses: parseHolmesBooleanFlag(
+      flags.getFlag(HOLMES_GRADE_MUTATION_PASSES_FLAG),
+    ),
+    graderTimeoutMs: parseHolmesTimeoutFlag(flags.getFlag(HOLMES_GRADER_TIMEOUT_MS_FLAG)),
+  };
+}
+
+function resetToolLogForNewRequest(toolLog: HolmesToolCallLog, requestDigest: string): void {
+  toolLog.currentTurn = [];
+  // Fresh request state keeps only the incoming digest bucket. Clearing every old
+  // bucket mirrors grader-cache pruning and prevents repeated text/digest
+  // collisions from inheriting stale attempts.
+  toolLog.byUserRequestDigest.clear();
+  toolLog.byUserRequestDigest.set(requestDigest, []);
+  toolLog.repeatedBlockCount = 0;
+}
+
+function parseHolmesBooleanFlag(value: boolean | string | undefined): boolean {
+  if (value === true) return true;
+  if (value !== false && typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    return normalized === "1" || normalized === "true";
+  }
+  return false;
+}
+
+function parseHolmesTimeoutFlag(value: boolean | string | undefined): number {
+  if (typeof value !== "string") return DEFAULT_GRADER_TIMEOUT_MS;
+  const normalized = value.trim();
+  if (!/^-?\d+$/.test(normalized)) return DEFAULT_GRADER_TIMEOUT_MS;
+  const parsed = Number(normalized);
+  if (!Number.isSafeInteger(parsed)) return DEFAULT_GRADER_TIMEOUT_MS;
+  return Math.min(MAX_HOLMES_GRADER_TIMEOUT_MS, Math.max(MIN_HOLMES_GRADER_TIMEOUT_MS, parsed));
 }

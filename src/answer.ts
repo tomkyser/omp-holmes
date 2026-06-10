@@ -34,11 +34,20 @@ import {
 import {
   assessReasoningWithCache,
   buildReasoningGraderPacket,
-  createReasoningGraderRequestCache,
   mapGraderOutcomeToObligations,
   type ReasoningGraderAssessor,
   type ReasoningGraderRequestCache,
 } from "./grader";
+declare module "./types" {
+  interface AnswerGateState {
+    lastMissingAxes?: string[];
+    satisfiedAtLevel?: AnswerObligationLevel;
+  }
+
+  interface ToolCallSummary {
+    failed?: boolean;
+  }
+}
 
 const REASONING_VERB = /\b(debug|design|architect|diagnose|trade-?off|root.cause|refactor|plan|investigate|review|compare|migrate)\b/gi;
 const NUMBERED_LIST_MARKER = /^\s*\d+[.)]\s+/gm;
@@ -50,7 +59,7 @@ const LINE_SELECTOR = /:\d+(?:[-+]\d+)?(?:,\d+(?:[-+]\d+)?)*$/u;
 const HASH_SELECTOR = /#[0-9A-Fa-f]{2,}$/u;
 const RAW_SELECTOR = /:(?:raw|conflicts)$/iu;
 const TERMINAL_PHASE: Partial<Record<AnswerGatePhase, true>> = { satisfied: true, soft_accept: true };
-
+const ANSWER_LEVEL_RANK: Record<AnswerObligationLevel, number> = { none: 0, light: 1, full: 2 };
 
 type ComplianceDetails = {
   satisfied: boolean;
@@ -60,7 +69,9 @@ type ComplianceDetails = {
   unverifiedMentions: string[];
 };
 
-const graderCachesByRequest = new Map<string, ReasoningGraderRequestCache>();
+export interface ReasoningGraderRuntime {
+  cacheForDigest(requestDigest: string): ReasoningGraderRequestCache;
+}
 
 export function collectTriageSignals(requestText: string): AnswerTriageSignals {
   const scan = limitText(requestText);
@@ -129,7 +140,7 @@ export function createAnswerGateState(
 ): AnswerGateState {
   // The caller owns stats.answerObligationsCreated: this factory has no stats parameter.
   return {
-    phase: level === "none" ? "satisfied" : "obligated",
+    phase: "obligated",
     level,
     requestDigest,
     createdAtSequence: sequence,
@@ -156,19 +167,31 @@ export async function processAnswerMessageEnd(args: {
   stats: HolmesStats;
   sequence: number;
   grader?: ReasoningGraderAssessor;
+  graderRuntime?: ReasoningGraderRuntime;
+  requestText?: string;
   liveTier34Record: boolean;
 }): Promise<void> {
-  if (args.state.phase === "idle" || TERMINAL_PHASE[args.state.phase]) return;
+  if (args.state.phase === "idle") return;
 
-  const calls = toolCallsForRequest(args.toolLog, args.state.requestDigest);
-  const nextLevel = escalateAnswerObligation(args.state.level, {
+  const previousLevel = args.state.level;
+  const calls = toolCallAttemptsForRequest(args.toolLog, args.state.requestDigest);
+  const nextLevel = escalateAnswerObligation(previousLevel, {
     toolCallsThisRequest: calls.length,
     effectfulToolCalls: calls.filter((call) => call.effectful).length,
     finalVisibleChars: args.observation.visibleText.length,
     codeBlocksInAnswer: countCodeBlocks(args.observation.visibleText),
     liveTier34Record: args.liveTier34Record,
   });
+  if (args.state.phase === "soft_accept") return;
+  if (previousLevel === "none" && nextLevel !== "none") {
+    args.stats.answerObligationsCreated++;
+  }
   args.state.level = nextLevel;
+
+  if (args.state.phase === "satisfied" && !reopenSatisfiedAtHigherLevel(args.state, previousLevel, nextLevel)) {
+    return;
+  }
+  if (args.state.level === "none") return;
 
   const details = evaluateAnswerComplianceDetails(args);
   if (!details.satisfied) return;
@@ -181,6 +204,8 @@ export async function processAnswerMessageEnd(args: {
       observation: args.observation,
       toolLog: args.toolLog,
       grader,
+      graderRuntime: args.graderRuntime,
+      requestText: args.requestText ?? "",
       stats: args.stats,
     });
     record.grader = grade.outcome;
@@ -193,6 +218,7 @@ export async function processAnswerMessageEnd(args: {
       softAccept(args.state, args.stats);
       return;
     }
+    recordCappedGraderDowngrade(args.state, grade.outcome, args.stats);
     satisfyAnswerGate(args.state, args.stats);
     return;
   }
@@ -209,12 +235,14 @@ export function handleAgentEnd(args: {
   ui?: ExtensionUIContext;
   stats: HolmesStats;
 }): void {
-  if (
-    args.state.phase === "idle" ||
-    args.state.phase === "satisfied" ||
-    args.state.phase === "soft_accept" ||
-    args.state.level === "none"
-  ) {
+  if (args.state.phase === "idle" || TERMINAL_PHASE[args.state.phase]) {
+    return;
+  }
+
+  if (args.state.level === "none") {
+    args.state.phase = "satisfied";
+    args.state.satisfiedAtLevel = "none";
+    delete args.state.lastMissingAxes;
     return;
   }
 
@@ -275,17 +303,29 @@ export async function executeHolmesCheckpoint(args: {
   observation: MessageObservationState;
   toolLog: HolmesToolCallLog;
   grader?: ReasoningGraderAssessor;
-  stats?: HolmesStats;
+  graderRuntime?: ReasoningGraderRuntime;
+  requestText?: string;
+  signal?: AbortSignal;
+  stats: HolmesStats;
 }): Promise<{ content: string; record: AnswerCheckpointRecord }> {
+  if (TERMINAL_PHASE[args.state.phase]) {
+    return {
+      content: `request already closed (${args.state.phase})`,
+      record: emptyCheckpointRecord(args.state, args.params, true),
+    };
+  }
+
   const shapeFailures = checkpointShapeFailures(args.params);
   const mentions = checkpointEvidenceMentions(args.params);
   const evidence = crossCheckEvidence(mentions, args.toolLog, args.state.requestDigest);
+  const toolCallAttempts = toolCallAttemptsForRequest(args.toolLog, args.state.requestDigest);
   const unverifiedClosedUnknowns = args.params.unknowns.filter(
     (unknown) => unknown.status === "closed" && !referenceIsVerified(unknown.closedBy ?? "", args.toolLog, args.state.requestDigest),
   );
   const shapeOk = shapeFailures.length === 0;
   const fullClosureOk = args.state.level !== "full" || unverifiedClosedUnknowns.length === 0;
-  const deterministicSatisfied = shapeOk && fullClosureOk;
+  const verifiedEvidenceOk = args.state.level !== "full" || toolCallAttempts.length === 0 || evidence.verifiedEvidenceIds.length > 0;
+  const deterministicSatisfied = shapeOk && fullClosureOk && verifiedEvidenceOk;
   const record: AnswerCheckpointRecord = {
     id: checkpointRecordId(args.state, args.params),
     requestDigest: args.state.requestDigest,
@@ -298,9 +338,19 @@ export async function executeHolmesCheckpoint(args: {
   };
 
   if (!deterministicSatisfied) {
+    const axes = [
+      ...shapeFailures,
+      ...(!fullClosureOk ? ["verified_closure"] : []),
+      ...(!verifiedEvidenceOk ? ["verified_evidence"] : []),
+    ];
+    args.state.lastMissingAxes = uniqueStrings(axes);
     args.state.checkpointRecords.push(record);
     return {
-      content: checkpointVerdict(false, shapeFailures.length > 0 ? shapeFailures : ["verified_closure"], "repair_with_visible_pass_or_checkpoint"),
+      content: checkpointVerdict(
+        false,
+        axes,
+        verifiedEvidenceOk ? "repair_with_visible_pass_or_checkpoint" : "verified_evidence_required",
+      ),
       record,
     };
   }
@@ -313,31 +363,31 @@ export async function executeHolmesCheckpoint(args: {
       toolLog: args.toolLog,
       checkpointParams: args.params,
       grader,
+      graderRuntime: args.graderRuntime,
+      requestText: args.requestText ?? "",
+      signal: args.signal,
       stats: args.stats,
     });
     record.grader = grade.outcome;
     args.state.checkpointRecords.push(record);
     if (grade.withholdSatisfaction) {
-      if (args.stats) consumeGraderHollowFlag(args.state, args.stats);
-      else args.state.graderHollowFlags++;
+      consumeGraderHollowFlag(args.state, args.stats);
       return {
         content: checkpointVerdict(false, grade.outcome.defectAxes, "bounded_grader_repair"),
         record,
       };
     }
     if (shouldSoftAcceptCappedGraderRejection(args.state, grade.outcome)) {
-      if (args.stats) softAccept(args.state, args.stats);
-      else args.state.phase = "soft_accept";
+      softAccept(args.state, args.stats);
       return { content: checkpointVerdict(false, grade.outcome.defectAxes, "bounded_grader_advisory"), record };
     }
-    if (args.stats) satisfyAnswerGate(args.state, args.stats);
-    else args.state.phase = "satisfied";
+    recordCappedGraderDowngrade(args.state, grade.outcome, args.stats);
+    satisfyAnswerGate(args.state, args.stats);
     return { content: checkpointVerdict(true, [], "satisfied"), record };
   }
 
   args.state.checkpointRecords.push(record);
-  if (args.stats) satisfyAnswerGate(args.state, args.stats);
-  else args.state.phase = "satisfied";
+  satisfyAnswerGate(args.state, args.stats);
   return { content: checkpointVerdict(true, [], "satisfied"), record };
 }
 
@@ -376,17 +426,17 @@ function evaluateAnswerComplianceDetails(args: {
   toolLog: HolmesToolCallLog;
   sequence: number;
 }): ComplianceDetails {
-  if (args.state.phase === "satisfied" || args.state.level === "none") {
-    return emptyCompliance(true);
+  if (TERMINAL_PHASE[args.state.phase] || args.state.level === "none") {
+    return rememberCompliance(args.state, emptyCompliance(true));
   }
 
   const passText = redactSelfClassification(args.observation.visibleText);
   if (args.sequence < args.state.createdAtSequence) {
-    return {
+    return rememberCompliance(args.state, {
       ...emptyCompliance(false),
       passText,
       missingAxes: ["answer_sequence"],
-    };
+    });
   }
 
   if (args.state.level === "light") {
@@ -396,13 +446,13 @@ function evaluateAnswerComplianceDetails(args: {
       ...(sections.delta ? [] : ["delta_section"]),
       ...(sections.next ? [] : ["next_section"]),
     ];
-    return {
+    return rememberCompliance(args.state, {
       satisfied: missing.length === 0,
       missingAxes: missing,
       passText,
       verifiedEvidenceIds: [],
       unverifiedMentions: [],
-    };
+    });
   }
 
   const sections = detectTier3SinglePassCompliance(passText);
@@ -422,13 +472,13 @@ function evaluateAnswerComplianceDetails(args: {
     ...(toolCalls.length === 0 || evidence.verifiedEvidenceIds.length === 0 ? ["verified_evidence"] : []),
   ];
 
-  return {
+  return rememberCompliance(args.state, {
     satisfied: missingAxes.length === 0,
     missingAxes,
     passText,
     verifiedEvidenceIds: evidence.verifiedEvidenceIds,
     unverifiedMentions: evidence.unverifiedMentions,
-  };
+  });
 }
 
 function shouldRunGrader(
@@ -450,61 +500,114 @@ async function assessReasoning(args: {
   toolLog: HolmesToolCallLog;
   checkpointParams?: HolmesCheckpointParams;
   grader: ReasoningGraderAssessor;
-  stats?: HolmesStats;
+  graderRuntime?: ReasoningGraderRuntime;
+  requestText: string;
+  signal?: AbortSignal;
+  stats: HolmesStats;
 }): Promise<{ outcome: ReasoningGraderOutcome; withholdSatisfaction: boolean }> {
-  const { packet } = buildReasoningGraderPacket({
+  const packetArgs = {
     level: args.state.level,
     observation: args.observation,
     toolLog: args.toolLog,
     checkpointParams: args.checkpointParams,
-  });
+    requestDigest: args.state.requestDigest,
+    requestText: args.requestText,
+  };
+  const { packet } = buildReasoningGraderPacket(packetArgs);
+  const scopedToolCalls = toolCallsForRequest(args.toolLog, args.state.requestDigest);
   let cached = false;
   let assessment: ReasoningGraderAssessment;
-  if (args.stats) {
-    const cache = reasoningCacheForRequest(args.state.requestDigest);
+
+  if (args.signal?.aborted) {
+    assessment = failedGraderAssessment();
+  } else if (args.graderRuntime) {
     try {
       const result = await assessReasoningWithCache({
         packet,
-        assessor: args.grader,
-        cache,
+        assessor: graderWithAbortSignal(args.grader, args.signal),
+        cache: args.graderRuntime.cacheForDigest(args.state.requestDigest),
         stats: args.stats,
       });
       assessment = result.assessment;
       cached = result.cached;
     } catch {
-      assessment = { status: "failed", defects: [], requiredAdditions: ["grader_unavailable"] };
+      assessment = failedGraderAssessment();
     }
   } else {
-    assessment = await callGrader(args.grader, packet, undefined);
+    assessment = await callGrader(args.grader, packet, args.stats, args.signal);
   }
 
   const mapped = mapGraderOutcomeToObligations(assessment, args.state);
-  const outcome = graderOutcome(assessment, mapped.obligations, cached);
+  const missingEvidenceWithhold = shouldWithholdMissingEvidenceGrade({
+    assessment,
+    state: args.state,
+    verifiedEvidenceIds: packet.facts.verifiedEvidenceIds,
+    scopedToolCalls,
+  });
+  const obligations = missingEvidenceWithhold ? uniqueStrings([...mapped.obligations, "closure"]) : mapped.obligations;
+  const outcome = graderOutcome(assessment, obligations, cached);
   return {
     outcome,
-    withholdSatisfaction: mapped.withholdSatisfaction,
+    withholdSatisfaction: mapped.withholdSatisfaction || missingEvidenceWithhold,
   };
+}
+
+function graderWithAbortSignal(
+  grader: ReasoningGraderAssessor,
+  signal: AbortSignal | undefined,
+): ReasoningGraderAssessor {
+  if (!signal) return grader;
+  return (packet) => callGrader(grader, packet, undefined, signal);
 }
 
 async function callGrader(
   grader: ReasoningGraderAssessor,
   packet: Parameters<ReasoningGraderAssessor>[0],
   stats: HolmesStats | undefined,
+  signal?: AbortSignal,
 ): Promise<ReasoningGraderAssessment> {
   if (stats) stats.graderCalls++;
+  if (signal?.aborted) return failedGraderAssessment();
   try {
-    return await grader(packet);
+    return await withAbortSignal(grader(packet), signal);
   } catch {
-    return { status: "failed", defects: [], requiredAdditions: ["grader_unavailable"] };
+    return failedGraderAssessment();
   }
 }
 
-function reasoningCacheForRequest(requestDigest: string): ReasoningGraderRequestCache {
-  const existing = graderCachesByRequest.get(requestDigest);
-  if (existing) return existing;
-  const created = createReasoningGraderRequestCache();
-  graderCachesByRequest.set(requestDigest, created);
-  return created;
+function shouldWithholdMissingEvidenceGrade(args: {
+  assessment: ReasoningGraderAssessment;
+  state: AnswerGateState;
+  verifiedEvidenceIds: readonly string[];
+  scopedToolCalls: readonly ToolCallSummary[];
+}): boolean {
+  return (
+    args.state.level === "full" &&
+    args.state.graderHollowFlags < MAX_GRADER_HOLLOW_FLAGS &&
+    args.scopedToolCalls.length > 0 &&
+    args.verifiedEvidenceIds.length === 0 &&
+    args.assessment.status === "succeeded" &&
+    (args.assessment.verdict === "hollow" || args.assessment.verdict === "incoherent")
+  );
+}
+
+function failedGraderAssessment(): ReasoningGraderAssessment {
+  return { status: "failed", defects: [], requiredAdditions: ["grader_unavailable"] };
+}
+
+async function withAbortSignal<T>(operation: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return operation;
+  if (signal.aborted) throw new Error("reasoning grader aborted");
+  let abort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => reject(new Error("reasoning grader aborted"));
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    return await Promise.race([operation, aborted]);
+  } finally {
+    if (abort) signal.removeEventListener("abort", abort);
+  }
 }
 
 
@@ -521,8 +624,17 @@ function graderOutcome(
 }
 
 function shouldSoftAcceptCappedGraderRejection(state: AnswerGateState, outcome: ReasoningGraderOutcome): boolean {
+  return state.phase === "awaiting_repair" && isCappedGraderRejection(state, outcome);
+}
+
+function recordCappedGraderDowngrade(state: AnswerGateState, outcome: ReasoningGraderOutcome, stats: HolmesStats): void {
+  if (state.phase !== "awaiting_repair" && isCappedGraderRejection(state, outcome)) {
+    stats.reasoningSoftViolations++;
+  }
+}
+
+function isCappedGraderRejection(state: AnswerGateState, outcome: ReasoningGraderOutcome): boolean {
   return (
-    state.phase === "awaiting_repair" &&
     state.graderHollowFlags >= MAX_GRADER_HOLLOW_FLAGS &&
     (outcome.verdict === "hollow" || outcome.verdict === "incoherent")
   );
@@ -534,14 +646,35 @@ function consumeGraderHollowFlag(state: AnswerGateState, stats: HolmesStats): vo
   stats.graderHollowFlags++;
 }
 
+function reopenSatisfiedAtHigherLevel(
+  state: AnswerGateState,
+  previousLevel: AnswerObligationLevel,
+  nextLevel: AnswerObligationLevel,
+): boolean {
+  const satisfiedAtLevel = state.satisfiedAtLevel ?? previousLevel;
+  if (!isHigherAnswerLevel(nextLevel, satisfiedAtLevel)) return false;
+  // Reopen is bounded: escalation is monotone over none < light < full, so a satisfied request
+  // can reopen only once per higher level (≤2 total); retriesUsed is preserved, keeping the
+  // one-demand cap across the original obligation and every reopen.
+  state.phase = "obligated";
+  delete state.lastMissingAxes;
+  return true;
+}
+
+function isHigherAnswerLevel(left: AnswerObligationLevel, right: AnswerObligationLevel): boolean {
+  return ANSWER_LEVEL_RANK[left] > ANSWER_LEVEL_RANK[right];
+}
+
 function satisfyAnswerGate(state: AnswerGateState, stats: HolmesStats): void {
-  if (state.phase === "satisfied") return;
+  if (TERMINAL_PHASE[state.phase]) return;
   state.phase = "satisfied";
+  state.satisfiedAtLevel = state.level;
+  delete state.lastMissingAxes;
   stats.answerCheckpointsSatisfied++;
 }
 
 function softAccept(state: AnswerGateState, stats: HolmesStats): void {
-  if (state.phase === "soft_accept") return;
+  if (TERMINAL_PHASE[state.phase]) return;
   state.phase = "soft_accept";
   stats.answerSoftAccepts++;
   stats.reasoningSoftViolations++;
@@ -557,6 +690,23 @@ function buildVisiblePassRecord(state: AnswerGateState, details: ComplianceDetai
     shapeOk: details.satisfied,
     verifiedEvidenceIds: details.verifiedEvidenceIds,
     unverifiedMentions: details.unverifiedMentions,
+  };
+}
+
+function emptyCheckpointRecord(
+  state: AnswerGateState,
+  params: HolmesCheckpointParams,
+  shapeOk: boolean,
+): AnswerCheckpointRecord {
+  return {
+    id: checkpointRecordId(state, params),
+    requestDigest: state.requestDigest,
+    createdAtSequence: state.createdAtSequence,
+    level: state.level,
+    source: "checkpoint_tool",
+    shapeOk,
+    verifiedEvidenceIds: [],
+    unverifiedMentions: [],
   };
 }
 
@@ -602,6 +752,7 @@ function demandAxes(state: AnswerGateState): string[] {
     if (!record.shapeOk) return ["checkpoint_shape"];
     if (record.unverifiedMentions.length > 0) return ["verified_evidence"];
   }
+  if (state.lastMissingAxes && state.lastMissingAxes.length > 0) return state.lastMissingAxes;
   return defaultMissingAxes(state.level);
 }
 
@@ -629,6 +780,15 @@ function emptyCompliance(satisfied: boolean): ComplianceDetails {
     verifiedEvidenceIds: [],
     unverifiedMentions: [],
   };
+}
+
+function rememberCompliance(state: AnswerGateState, details: ComplianceDetails): ComplianceDetails {
+  if (details.satisfied) {
+    delete state.lastMissingAxes;
+  } else {
+    state.lastMissingAxes = uniqueStrings(details.missingAxes);
+  }
+  return details;
 }
 
 function crossCheckEvidence(
@@ -674,10 +834,23 @@ function toolEvidencePaths(toolLog: HolmesToolCallLog, requestDigest: string): s
   return paths;
 }
 
-function toolCallsForRequest(toolLog: HolmesToolCallLog, requestDigest: string): ToolCallSummary[] {
+export function toolCallsForRequest(toolLog: HolmesToolCallLog, requestDigest: string): ToolCallSummary[] {
+  return collectToolCallsForRequest(toolLog, requestDigest, false);
+}
+
+function toolCallAttemptsForRequest(toolLog: HolmesToolCallLog, requestDigest: string): ToolCallSummary[] {
+  return collectToolCallsForRequest(toolLog, requestDigest, true);
+}
+
+function collectToolCallsForRequest(
+  toolLog: HolmesToolCallLog,
+  requestDigest: string,
+  includeFailed: boolean,
+): ToolCallSummary[] {
   const calls: ToolCallSummary[] = [];
   const seen = new Set<string>();
   for (const call of [...(toolLog.byUserRequestDigest.get(requestDigest) ?? []), ...toolLog.currentTurn]) {
+    if (!includeFailed && call.failed === true) continue;
     const key = call.toolCallId || call.inputFingerprint;
     if (seen.has(key)) continue;
     seen.add(key);

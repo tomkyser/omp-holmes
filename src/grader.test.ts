@@ -100,6 +100,14 @@ function expectNoObligationChange(assessment: ReasoningGraderAssessment): void {
 function coherentRaw(): string {
   return JSON.stringify({ status: "succeeded", verdict: "coherent", defects: [], requiredAdditions: [] });
 }
+function emptyAssessment(status: "failed" | "skipped"): ReasoningGraderAssessment {
+  return { status, defects: [], requiredAdditions: [] };
+}
+
+function coherentAssessment(): ReasoningGraderAssessment {
+  return { status: "succeeded", verdict: "coherent", defects: [], requiredAdditions: [] };
+}
+
 
 describe("reasoning grader parser", () => {
   test("malformed missing and authority-shaped outputs fail closed with no obligations", () => {
@@ -220,7 +228,41 @@ describe("reasoning grader cache", () => {
     expect(stats.graderCalls).toBe(MAX_GRADER_CALLS_PER_REQUEST);
     expect(stats.graderCacheHits).toBe(1);
   });
+  test("failed and skipped assessments are not cached", async () => {
+    const failedCache = createReasoningGraderRequestCache();
+    let failedCalls = 0;
+    const failedThenSucceeded = async (): Promise<ReasoningGraderAssessment> => {
+      failedCalls += 1;
+      return failedCalls === 1 ? emptyAssessment("failed") : coherentAssessment();
+    };
+
+    const failedFirst = await assessReasoningWithCache({ packet: packet("failed"), assessor: failedThenSucceeded, cache: failedCache });
+    const failedSecond = await assessReasoningWithCache({ packet: packet("failed"), assessor: failedThenSucceeded, cache: failedCache });
+
+    expect(failedFirst.assessment.status).toBe("failed");
+    expect(failedFirst.cached).toBe(false);
+    expect(failedSecond.assessment.status).toBe("succeeded");
+    expect(failedSecond.cached).toBe(false);
+    expect(failedCalls).toBe(2);
+
+    const skippedCache = createReasoningGraderRequestCache();
+    let skippedCalls = 0;
+    const skippedThenSucceeded = async (): Promise<ReasoningGraderAssessment> => {
+      skippedCalls += 1;
+      return skippedCalls === 1 ? emptyAssessment("skipped") : coherentAssessment();
+    };
+
+    const skippedFirst = await assessReasoningWithCache({ packet: packet("skipped"), assessor: skippedThenSucceeded, cache: skippedCache });
+    const skippedSecond = await assessReasoningWithCache({ packet: packet("skipped"), assessor: skippedThenSucceeded, cache: skippedCache });
+
+    expect(skippedFirst.assessment.status).toBe("skipped");
+    expect(skippedFirst.cached).toBe(false);
+    expect(skippedSecond.assessment.status).toBe("succeeded");
+    expect(skippedSecond.cached).toBe(false);
+    expect(skippedCalls).toBe(2);
+  });
 });
+
 
 describe("reasoning grader timeout", () => {
   test("hanging model resolves failed within the configured cap and changes no obligations", async () => {
@@ -235,16 +277,96 @@ describe("reasoning grader timeout", () => {
     expect(elapsedMs).toBeLessThan(500);
     expectNoObligationChange(assessment);
   });
+  test("callModel requests JSON response format", async () => {
+    let captured: Record<string, unknown> | undefined;
+    const ctx = fakeContext((request) => {
+      captured = request as Record<string, unknown>;
+      return coherentRaw();
+    });
+    const assessor = createExtensionOwnedReasoningGrader({ ctx, timeoutMs: 100 });
+    const assessment = await assessor(packet("one"));
+
+    expect(assessment.status).toBe("succeeded");
+    expect(captured?.responseFormat).toEqual({ type: "json_object" });
+  });
 });
+
 
 describe("reasoning grader packet", () => {
   test("splits verified evidence from tool-log-matched refs", () => {
     const observation = createObservationState(1);
     observation.visibleText = "TARGET: answer\nDELTA: read src/one.ts:10-12 and bogus.ts\nNEXT: cite checked path";
-    const built = buildReasoningGraderPacket({ level: "full", observation, toolLog: toolLog("src/one.ts") });
+    const built = buildReasoningGraderPacket({
+      level: "full",
+      observation,
+      toolLog: toolLog("src/one.ts"),
+      requestDigest: "request-digest",
+      requestText: "Investigate the request.",
+    });
 
     expect(built.packet.facts.verifiedEvidenceIds).toEqual(["src/one.ts:10-12"]);
     expect(built.packet.facts.unverifiedMentions).toContain("bogus.ts");
     expect(built.evidenceIds.has("src/one.ts:10-12")).toBe(true);
   });
+  test("uses request-scoped prior-turn tool calls for evidence and summaries", () => {
+    const observation = createObservationState(1);
+    observation.visibleText = "TARGET: answer\nDELTA: read src/prior.ts:10-12 and missing.ts\nNEXT: cite checked path";
+    const log = toolLog("src/current.ts");
+    log.currentTurn[0] = {
+      ...log.currentTurn[0],
+      toolCallId: "current-read",
+      inputDigest: "current-input",
+      inputFingerprint: "read:current-input",
+      affectedPaths: ["src/current.ts"],
+      timestampMs: 2,
+    };
+    log.byUserRequestDigest.set("request-digest", [{
+      ...log.currentTurn[0],
+      toolCallId: "prior-read",
+      inputDigest: "prior-input",
+      inputFingerprint: "read:prior-input",
+      affectedPaths: ["src/prior.ts"],
+      timestampMs: 1,
+    }]);
+
+    const built = buildReasoningGraderPacket({
+      level: "full",
+      observation,
+      toolLog: log,
+      requestDigest: "request-digest",
+      requestText: "Investigate the prior turn.",
+    });
+
+    expect(built.packet.facts.verifiedEvidenceIds).toEqual(["src/prior.ts:10-12"]);
+    expect(built.packet.facts.unverifiedMentions).toContain("missing.ts");
+    expect(built.packet.facts.toolCallSummary).toEqual([
+      { tool: "read", pathish: ["src/prior.ts"] },
+      { tool: "read", pathish: ["src/current.ts"] },
+    ]);
+  });
+
+  test("keeps user request excerpt separate from checkpoint target", () => {
+    const observation = createObservationState(1);
+    observation.visibleText = "TARGET: answer\nDELTA: checked src/one.ts\nNEXT: report";
+    const checkpointParams = {
+      target: "Checkpoint target must stay quarantined.",
+      chain: [],
+      unknowns: [],
+      plan: [],
+    };
+
+    const built = buildReasoningGraderPacket({
+      level: "full",
+      observation,
+      toolLog: toolLog("src/one.ts"),
+      requestDigest: "request-digest",
+      requestText: "Actual user request text.",
+      checkpointParams,
+    });
+
+    expect(built.packet.untrustedClaims.userRequestExcerpt).toBe("Actual user request text.");
+    expect(built.packet.untrustedClaims.userRequestExcerpt).not.toContain("Checkpoint target");
+    expect(built.packet.untrustedClaims.checkpointParams?.target).toBe("Checkpoint target must stay quarantined.");
+  });
+
 });

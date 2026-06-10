@@ -8,6 +8,7 @@ import {
   extractEvidenceReferences,
   redactSelfClassification,
 } from "./observation";
+import { toolCallsForRequest } from "./answer";
 import {
   DEFAULT_CLASSIFIER_TIMEOUT_MS,
   DEFAULT_GRADER_TIMEOUT_MS,
@@ -27,6 +28,7 @@ import type {
   MutationLease,
   ReasoningGraderAssessment,
   ReasoningGraderPacket,
+  ToolCallSummary,
 } from "./types";
 
 const REASONING_GRADER_PROMPT_VERSION = "holmes-reasoning-grader-prompt-v1";
@@ -55,6 +57,7 @@ interface ReasoningGraderCallModelRequest {
   tools: [];
   temperature: 0;
   maxTokens: number;
+  responseFormat: { type: "json_object" };
   disableReasoning: true;
   hideThinkingSummary: true;
   streamFirstEventTimeoutMs: number;
@@ -197,6 +200,7 @@ export async function completeReasoningGraderModel(args: CompleteReasoningGrader
     tools: [],
     temperature: 0,
     maxTokens: REASONING_GRADER_MAX_TOKENS,
+    responseFormat: { type: "json_object" },
     disableReasoning: true,
     hideThinkingSummary: true,
     streamFirstEventTimeoutMs: args.timeoutMs,
@@ -245,6 +249,8 @@ export function buildReasoningGraderPacket(args: {
   level: ReasoningGraderPacket["facts"]["level"];
   observation: MessageObservationState;
   toolLog: ToolLogState;
+  requestDigest: string;
+  requestText: string;
   checkpointParams?: HolmesCheckpointParams;
   lease?: MutationLease;
 }): { packet: ReasoningGraderPacket; evidenceIds: Set<string> } {
@@ -253,7 +259,8 @@ export function buildReasoningGraderPacket(args: {
   const tier3 = detectTier3SinglePassCompliance(passText);
   const tier4 = detectTier4Pass(passText);
   const evidenceMentions = collectEvidenceMentions(passText, args.checkpointParams);
-  const { verifiedEvidenceIds, unverifiedMentions } = splitEvidenceMentions(evidenceMentions, args.toolLog);
+  const requestToolCalls = toolCallsForRequest(args.toolLog, args.requestDigest);
+  const { verifiedEvidenceIds, unverifiedMentions } = splitEvidenceMentions(evidenceMentions, requestToolCalls);
   const evidenceIds = new Set(verifiedEvidenceIds);
   const packet: ReasoningGraderPacket = {
     facts: {
@@ -273,14 +280,14 @@ export function buildReasoningGraderPacket(args: {
         tier4Pass: tier4.passContent.length > 0,
         tier4EvidenceRefs: tier4.evidenceRefs.length > 0,
       },
-      toolCallSummary: args.toolLog.currentTurn.map(call => ({
+      toolCallSummary: requestToolCalls.map(call => ({
         tool: call.toolName,
         pathish: unique(call.affectedPaths.map(limitText)),
       })),
       ...(args.lease && args.lease.paths.length > 0 ? { leasePaths: unique(args.lease.paths.map(limitText)) } : {}),
     },
     untrustedClaims: {
-      userRequestExcerpt: limitText(args.checkpointParams?.target ?? ""),
+      userRequestExcerpt: limitText(args.requestText),
       passText,
       ...(args.checkpointParams ? { checkpointParams: args.checkpointParams } : {}),
     },
@@ -377,7 +384,7 @@ export async function assessReasoningWithCache(args: {
   args.cache.calls += 1;
   if (args.stats) args.stats.graderCalls += 1;
   const assessment = await args.assessor(args.packet).catch(() => emptyAssessment("failed"));
-  args.cache.assessments.set(key, assessment);
+  if (assessment.status === "succeeded") args.cache.assessments.set(key, assessment);
   return { key, assessment, cached: false, skippedForLimit: false };
 }
 
@@ -428,20 +435,20 @@ function collectEvidenceMentions(passText: string, checkpointParams: HolmesCheck
 
 function splitEvidenceMentions(
   mentions: readonly string[],
-  toolLog: ToolLogState,
+  toolCalls: readonly ToolCallSummary[],
 ): { verifiedEvidenceIds: string[]; unverifiedMentions: string[] } {
   const verifiedEvidenceIds: string[] = [];
   const unverifiedMentions: string[] = [];
   for (const mention of mentions) {
-    if (evidenceMatchesToolLog(mention, toolLog)) verifiedEvidenceIds.push(mention);
+    if (evidenceMatchesToolLog(mention, toolCalls)) verifiedEvidenceIds.push(mention);
     else unverifiedMentions.push(mention);
   }
   return { verifiedEvidenceIds: unique(verifiedEvidenceIds), unverifiedMentions: unique(unverifiedMentions) };
 }
 
-function evidenceMatchesToolLog(mention: string, toolLog: ToolLogState): boolean {
+function evidenceMatchesToolLog(mention: string, toolCalls: readonly ToolCallSummary[]): boolean {
   const normalizedMention = normalizeEvidencePath(mention);
-  for (const call of toolLog.currentTurn) {
+  for (const call of toolCalls) {
     if (mention === call.toolCallId || mention === call.inputDigest || mention === call.inputFingerprint || mention === call.effectFingerprint) {
       return true;
     }
