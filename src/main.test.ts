@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type {
   BeforeAgentStartEvent,
   ExtensionAPI,
@@ -75,6 +78,23 @@ const README_PATCH = [
   "¶README.md#ABCD",
   "replace 1..1:",
   "+Corrected typo.",
+  "*** End Patch",
+].join("\n");
+const DOC_FIXTURE_PATH = "docs-fixture.md";
+const DOC_FIXTURE_REQUEST = "Fix docs fixture typo";
+const DOC_FIXTURE_REQUEST_DIGEST = hash("request:fix-docs-fixture-typo");
+const DOC_FIXTURE_LINES = [
+  "# Docs Fixture",
+  "",
+  "This sentnce has a typo.",
+  "More documentation prose.",
+] as const;
+const DOC_FIXTURE_CONTENT = `${DOC_FIXTURE_LINES.join("\n")}\n`;
+const DOC_FIXTURE_PATCH = [
+  "*** Begin Patch",
+  `¶${DOC_FIXTURE_PATH}#ABCD`,
+  "replace 3..3:",
+  `+${DOC_FIXTURE_LINES[2].replace("sentnce", "sentence")}`,
   "*** End Patch",
 ].join("\n");
 const COMMENT_PATCH = [
@@ -356,6 +376,62 @@ function params(overrides: Partial<HolmesClassifyParams> = {}): HolmesClassifyPa
   if (impact) result.impact = impact;
   else delete (result as Partial<HolmesClassifyParams>).impact;
   return result;
+}
+
+function docFixturePlannedAction(overrides: Partial<HolmesClassifyPlannedAction> = {}): HolmesClassifyPlannedAction {
+  return plannedAction({
+    paths: [DOC_FIXTURE_PATH],
+    exactOpaqueInput: DOC_FIXTURE_PATCH,
+    summary: "Fix docs fixture prose typo only.",
+    structuredEffect: {
+      kind: "edit",
+      path: DOC_FIXTURE_PATH,
+      exactPatch: DOC_FIXTURE_PATCH,
+      semanticClassClaim: "docs prose typo only",
+    },
+    ...overrides,
+  });
+}
+
+function docFixtureParams(overrides: Partial<HolmesClassifyParams> = {}): HolmesClassifyParams {
+  return params({
+    ...overrides,
+    target: {
+      summary: "Fix docs fixture typo only.",
+      files: [DOC_FIXTURE_PATH],
+      tools: ["edit"],
+      operationKind: "mechanical_text" as OperationKind,
+      expectedMutationCount: 1,
+      ...(overrides.target ?? {}),
+    },
+    intentAlignment: {
+      claimedAlignment: "aligned",
+      explanation: "The planned docs fixture typo fix matches the user request.",
+      ...(overrides.intentAlignment ?? {}),
+    },
+    holmes: {
+      target: "Fix docs fixture typo only.",
+      now: `${DOC_FIXTURE_PATH} is a docs prose file; one misspelled plain text word is identified.`,
+      delta: "Replace misspelled prose with corrected prose.",
+      next: `Apply the exact ${DOC_FIXTURE_PATH} edit, then verify by read-back.`,
+      knownFacts: [`${DOC_FIXTURE_PATH} is documentation prose.`],
+      assumptions: [],
+      unknowns: [],
+      ...(overrides.holmes ?? {}),
+    },
+    plannedActions: overrides.plannedActions ?? [docFixturePlannedAction()],
+    reasoning: overrides.reasoning ?? `${DOC_FIXTURE_PATH} docs prose correction only. File is documentation with no runtime, executable, or programmatic content. Single misspelled word in plain text paragraph. Verify by read-back.`,
+  });
+}
+
+async function withDocFixture<T>(run: (cwd: string) => T | Promise<T>): Promise<T> {
+  const cwd = mkdtempSync(join(tmpdir(), "holmes-doc-fixture-"));
+  try {
+    writeFileSync(join(cwd, DOC_FIXTURE_PATH), DOC_FIXTURE_CONTENT, "utf8");
+    return await run(cwd);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
 }
 
 function snapshot(overrides: Record<string, unknown> = {}) {
@@ -2032,14 +2108,22 @@ describe("HOLMES custom tool registration and execution", () => {
   test("execute commits a record atomically and returns auditable details", async () => {
     const mock = createMockExtensionAPI();
     const classification = createMockClassificationState();
-    const observation = observeVisible("TARGET: Fix README typo.\nDELTA: exact prose-only edit.");
+    const observation = observeVisible(`TARGET: ${DOC_FIXTURE_REQUEST}.\nDELTA: exact prose-only docs fixture edit.`);
     const toolLog = createToolLog();
-    const turn = createTurn();
+    const turn = createTurn({ latestUserRequest: DOC_FIXTURE_REQUEST, latestUserRequestDigest: DOC_FIXTURE_REQUEST_DIGEST });
     const stats = createStats();
     registerHolmesClassifyTool({ pi: mock.pi, classification, observation: () => observation, turn, toolLog, stats });
 
     const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
-    const result = await tool.execute("classify-1", params(), new AbortController().signal, undefined, mock.ctx);
+    const result = await withDocFixture((cwd) =>
+      tool.execute(
+        "classify-1",
+        docFixtureParams(),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
+    );
 
     expect(classification.history.length).toBe(1);
     expect(classification.activeProcess?.source).toBe("holmes_classify_tool");
@@ -2098,41 +2182,45 @@ describe("HOLMES extension factory integration", () => {
   test("full flow: no classification blocks, classify then exact covered edit allows", async () => {
     const mock = createMockExtensionAPI();
     holmes(mock.pi);
-    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: REQUEST }] }] });
+    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: DOC_FIXTURE_REQUEST }] }] });
     mock.invoke("turn_start", { type: "turn_start", turnIndex: 1 });
 
-    const event = editCall();
+    const event = editCall(DOC_FIXTURE_PATCH);
     expect(mock.invoke("tool_call", event)?.block).toBe(true);
 
     const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
-    await tool.execute(
-      "classify-1",
-      params({ plannedActions: [plannedAction({ exactOpaqueInput: README_PATCH, structuredEffect: { kind: "edit", path: "README.md", exactPatch: README_PATCH, semanticClassClaim: "docs prose typo only" } })] }),
-      new AbortController().signal,
-      undefined,
-      mock.ctx,
+    await withDocFixture((cwd) =>
+      tool.execute(
+        "classify-1",
+        docFixtureParams(),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
     );
 
-    mock.invoke("message_update", mockTextDelta(0, "TARGET: Fix README typo.\nDELTA: exact prose-only README edit and verify by read."));
+    mock.invoke("message_update", mockTextDelta(0, `TARGET: ${DOC_FIXTURE_REQUEST}.\nDELTA: exact prose-only ${DOC_FIXTURE_PATH} edit and verify by read.`));
     expect(mock.invoke("tool_call", event)).toBeUndefined();
   });
 
   test("turn reset preserves classification history for same user request", async () => {
     const mock = createMockExtensionAPI();
     holmes(mock.pi);
-    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: REQUEST }] }] });
+    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: DOC_FIXTURE_REQUEST }] }] });
     const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
-    const event = editCall();
-    await tool.execute(
-      "classify-1",
-      params({ plannedActions: [plannedAction({ exactOpaqueInput: README_PATCH, structuredEffect: { kind: "edit", path: "README.md", exactPatch: README_PATCH, semanticClassClaim: "docs prose typo only" } })] }),
-      new AbortController().signal,
-      undefined,
-      mock.ctx,
+    const event = editCall(DOC_FIXTURE_PATCH);
+    await withDocFixture((cwd) =>
+      tool.execute(
+        "classify-1",
+        docFixtureParams(),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
     );
 
     mock.invoke("turn_start", { type: "turn_start", turnIndex: 2 });
-    mock.invoke("message_update", mockTextDelta(0, "TARGET: Fix README typo.\nDELTA: exact prose-only README edit and verify by read."));
+    mock.invoke("message_update", mockTextDelta(0, `TARGET: ${DOC_FIXTURE_REQUEST}.\nDELTA: exact prose-only ${DOC_FIXTURE_PATH} edit and verify by read.`));
 
     expect(mock.invoke("tool_call", event)).toBeUndefined();
   });
@@ -2140,12 +2228,20 @@ describe("HOLMES extension factory integration", () => {
   test("new user request invalidates old classification", async () => {
     const mock = createMockExtensionAPI();
     holmes(mock.pi);
-    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: REQUEST }] }] });
+    mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: DOC_FIXTURE_REQUEST }] }] });
     const tool = mock.tools.get(HOLMES_CLASSIFY_TOOL);
-    await tool.execute("classify-1", params(), new AbortController().signal, undefined, mock.ctx);
+    await withDocFixture((cwd) =>
+      tool.execute(
+        "classify-1",
+        docFixtureParams(),
+        new AbortController().signal,
+        undefined,
+        { ...mock.ctx, cwd },
+      ),
+    );
 
     mock.invoke("context", { type: "context", messages: [{ role: "user", content: [{ type: "text", text: "Now change src/guards.ts" }] }] });
-    const result = mock.invoke("tool_call", editCall());
+    const result = mock.invoke("tool_call", editCall(DOC_FIXTURE_PATCH));
 
     expect(result?.block).toBe(true);
     expect(result?.reason).toMatch(/new user request|classif|lease|scope/i);

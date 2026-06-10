@@ -1,20 +1,21 @@
 # omp-holmes
 
-OMP extension implementing the HOLMES cognitive redirect and reasoning enforcement framework.
+OMP extension implementing HOLMES: cognitive enforcement of backward reasoning via a four-tier prove-down classification gate.
 
 ## Structure
-- `src/` — runtime extension: `main.ts` factory entry, classification engine, observation, guards, prompts, types, and `main.test.ts` unit suite
+- `src/` — runtime extension: `main.ts` factory entry; `classification.ts` prove-down engine (floors, certificates, prosecutor, leases, ledger, `holmes_classify`); `observation.ts` bounded visible-text observation; `guards.ts` tool-call gates; `prompts.ts` system prompt + command builders; `types.ts` shared types; `main.test.ts` unit suite
 - `rules/` — TTSR rules; conditions are JavaScript `new RegExp`-compatible regex, not PCRE
 - `skills/holmes/` — full HOLMES playbook skill + reference files
-- `agents/` — source contract text for Task `explore`/`oracle` delegation; not native agent names
-- `commands/` — slash-command assets (`/holmes`, `/holmes-goal`)
+- `agents/` — retained source contract text for Task `explore`/`oracle` delegation; NOT runtime-discovered agent names
+- `commands/` — slash-command assets (`/holmes`, `/holmes-goal`; `/holmes-status` is registered in code)
 - `research/` — historical RALPH design docs
-- `.planning/` — living plan, reviews, and test reports
+- `.planning/`, `.omp/` — gitignored, local-only
 
 ## Build
 No build step. OMP loads `./src/main.ts` via `package.json` `omp.extensions`.
 
-`bun test src/main.test.ts` runs the unit suite; `bun run check` typechecks.
+- `bun test src/main.test.ts` — unit suite
+- `bun run check` — typecheck (`tsc --noEmit`)
 
 ## Use locally
 Use the extension root:
@@ -24,10 +25,11 @@ omp --extension ./
 
 Or configure `.omp/settings.json`:
 ```json
-{"extensions": ["./"]}
+{"extensions": ["./"], "ttsr": {"repeatMode": "afterGap", "repeatGap": 3}}
 ```
 
 ## Conventions
 - Skills use YAML frontmatter + Markdown body
 - Commands are Markdown with YAML frontmatter and `$ARGUMENTS` substitution
-- Package-local `agents/*.md` files are retained source contracts for bundled Task agents, not runtime-discovered agent names
+- The model never authorizes mutation: only the extension-owned `holmes_classify` record does; keep that invariant when editing gates or prompts
+- `APPEND_SYSTEM.md` is the source copy of `HOLMES_SYSTEM_PROMPT` in `src/prompts.ts`; keep them in sync
