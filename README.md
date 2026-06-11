@@ -1,20 +1,24 @@
 # omp-holmes
 
-HOLMES makes an AI coding agent prove its work before it is allowed to act on anything that matters.
+HOLMES is a reasoning framework for LLM agents, shipped as a plugin for [OMP](https://omp.sh), a coding-agent harness. It makes an agent work out what you actually asked for, reason backward from that end state, and prove the work, before it is allowed to act on anything that matters.
 
-It is a plugin for [OMP](https://omp.sh), a coding-agent harness. The problem it exists for is one every agent user has met: agents act confident whether or not they have done the work. Given a task, an agent will start editing before it understands the problem, explore just deep enough to sound informed, skip verification, and report success either way. Telling it to be careful (rules files, system prompts) helps until it ignores the instruction, and it ignores the instruction precisely when stakes and pressure are highest, because an instruction is a request.
+Watch an unassisted agent take a non-trivial task and the pattern is always the same: anchor on the first plausible interpretation, start reading and searching, a dozen calls, two dozen, assemble a story from whatever came back, edit, report success in confident prose. The result is built on satisficing assumptions, whatever was good enough to keep moving. When it is wrong, it is wrong with conviction.
 
-HOLMES does not make requests. It is code that sits between the model and the world and withholds two permissions until evidence shows up:
+HOLMES inverts the order. Before the agent may explore, it has to establish what the finished result looks like as the user intended it, separate what it knows from what it is assuming, and name the unknowns a lookup is supposed to close. The engine underneath is abductive reasoning: start from the desired result, infer what would have to be true for that result to hold, then verify those conditions instead of wandering toward them. Search stops being a fishing trip and becomes a step that fills a named variable.
 
-**Permission to change things.** Before the agent may edit a file or run a state-changing command, it must declare the exact change it intends and prove how much impact that change can have. The proof is checked by plugin code against real bytes: the actual diff, the actual file contents, the actual tool results. What it gets back is not approval but a lease, covering that exact change and nothing else, which expires on its own and evaporates the moment the agent's real action drifts from the declared one. The "while I'm here" extra fix dies at this gate.
+The change is visible in ordinary use. Instead of a wall of one-off reads, the agent thinks, then acts in a few deliberate strokes; a request that would have burned thirty exploratory calls tends to come back as one composed program in the agent's sandbox, delivered in what looks like a single shot, because the thinking happened before the acting.
 
-**Permission to be done.** A substantive answer does not close just because the agent stopped talking. The agent has to show its reasoning, and the evidence cited in that reasoning is checked against what the plugin watched it actually read during the request. "I verified this" counts for nothing; a passing tool result counts. If the answer arrives without the reasoning, the agent gets exactly one demand to produce it, and a refusal is logged rather than looped on.
+None of this happens because a prompt asked nicely. Prompts decay, and a model under pressure satisfices; that is what it is. So the discipline is enforced rather than requested. A deterministic cognitive redirect interrupts the forward chain at the start of every piece of work: stop, define done, sort known from assumed from unknown, only then classify the gap. A deterministic classifier reads the request itself and decides how much proof closing it will require. Runtime gates hold the line, and at those gates the agent's own claims count for nothing; only evidence the plugin observed with its own code unlocks anything.
 
-The model's own claims never unlock anything; only facts the plugin observed itself can. And trivial work stays free. "What branch am I on?" triggers no ceremony at all, because an enforcement system that taxes everything teaches its operator to uninstall it.
+Trivial work stays free. "What branch am I on?" triggers no ceremony at all, because an enforcement system that taxes everything teaches its operator to uninstall it.
+
+One honest note on what is actually happening underneath. The output reads like objective, extrapolative thinking: end state first, unknowns named, evidence closing them. No new faculty was added to the model. A language model interpolates; HOLMES is attention steering, arranging what the model attends to so that interpolation lands where genuine backward reasoning would have. The bet is that the gap between a sloppy agent and a rigorous one was never raw capability. It is what the next token is conditioned on.
 
 ## The two gates
 
-### Changing anything
+### Permission to change things
+
+Before the agent may edit a file or run a state-changing command, it must declare the exact change and prove its blast radius. What it gets back is a lease for that exact change and nothing else; drift from the declaration and the lease evaporates. The "while I'm here" extra fix dies at this gate.
 
 ```mermaid
 flowchart TD
@@ -27,7 +31,9 @@ flowchart TD
     S --> L
 ```
 
-### Closing an answer
+### Permission to be done
+
+A substantive answer does not close because the agent stopped talking. The reasoning has to be shown, and evidence cited in it is checked against what the agent actually read during the request. "I verified this" counts for nothing; a passing tool result counts. One repair demand, never a loop.
 
 ```mermaid
 flowchart TD
