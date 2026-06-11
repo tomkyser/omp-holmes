@@ -2,6 +2,19 @@
 
 OMP extension implementing HOLMES: extension-owned four-tier mutation classification plus per-request answer obligations. Conceptual deep-dive: [FRAMEWORK.md](FRAMEWORK.md).
 
+## Objective
+
+HOLMES is a reasoning framework first. The enforcement machinery exists to produce a cognitive shift in the agent, not to police for its own sake. Every change should serve one of two coupled pillars:
+
+1. Cognitive reframe — the agent extrapolates the objective desired effect of a request (inferred intent, not request text) and reasons END → NOW until the unknowns are named. Abduction is the method; forward-chaining and satisficing are the failure modes it displaces.
+2. Composed execution — the agent favors designed, consolidated operations (one program in the sandbox, blocks of one-shot operations) over chains of primitive read/search/edit calls, the way a person who has reasoned scripts the solution instead of taking a thousand blind actions.
+
+The pillars are coupled: consolidation is the observable signature of having reasoned. A program requires its variables named before it can be written, so a long primitive chain is what forward-chaining looks like in telemetry, and a composed one-shot is what a closed unknown map looks like. Tool-call count is a proxy metric for reasoning quality. The Claude Code-era RALPH prototype cut tool calls roughly 90% across all task types, including non-code work; making that reduction real and measurable in this binding is the success criterion.
+
+Status against the pillars: pillar one is enforced (redirect, prove-down classification, universal answer obligations, reasoning grader). Pillar two has only its negative rail today (primitive-burst guard; eval gated as a mutation-bypass threat). The open front is the affirmative half: doctrine that teaches composed discovery/compute as the favored mode, provenance so consolidated operations stay extension-observable, and efficiency telemetry in `HolmesStats`.
+
+Ceilings to respect: intent fidelity is not runtime-observable, so anything grading it stays advisory-first and bounded, never a hard gate; the extension counter-steers the harness's tool-pushing rails but cannot remove them; the frictionless floor and the bounded-coercion invariants (FRAMEWORK.md §4g) outrank any new enforcement idea.
+
 ## Structure
 - `src/` — runtime extension:
   - `main.ts` factory entry; registers `/holmes`, `/holmes-goal`, `/holmes-status`, `holmes_classify`, `holmes_checkpoint`, and config flags
