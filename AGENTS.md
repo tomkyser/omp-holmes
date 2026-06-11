@@ -25,15 +25,11 @@ No build step. OMP loads `./src/main.ts` via `package.json` `omp.extensions`.
 - `bun run check` — typecheck (`tsc --noEmit`)
 
 ## Use locally
-Use the extension root:
+Never enable the extension for this repository itself (no `extensions` entry in the local gitignored `.omp/settings.json`): HOLMES gates tool calls, and a gate broken mid-development can block the edits needed to fix it. Opt in per session when testing live:
 ```sh
 omp --extension ./
 ```
-
-Or configure `.omp/settings.json`:
-```json
-{"extensions": ["./"], "ttsr": {"repeatMode": "afterGap", "repeatGap": 3}}
-```
+For project-level or global enablement, see "Enabling it" in README.md (project `.omp/settings.json` or `~/.omp/agent/config.yml`, pointing at the package root).
 
 ## Conventions
 - Skills use YAML frontmatter + Markdown body
