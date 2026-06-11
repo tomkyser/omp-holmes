@@ -1,15 +1,50 @@
 # omp-holmes
 
-HOLMES is a cognitive enforcement extension for [OMP](https://omp.sh). Prompts that ask a model to reason carefully are advisory: the model can ignore them, and under pressure it does. HOLMES gives trusted extension code the last word instead. The runtime gets the final say on two surfaces: mutations (before effectful tools run) and answers (before a request counts as closed). Mutation authority comes only from the `holmes_classify` tool; answer closure comes only from an extension-observed visible pass or `holmes_checkpoint`.
+HOLMES makes an AI coding agent prove its work before it is allowed to act on anything that matters.
 
-It is built against two model tendencies:
+It is a plugin for [OMP](https://omp.sh), a coding-agent harness. The problem it exists for is one every agent user has met: agents act confident whether or not they have done the work. Given a task, an agent will start editing before it understands the problem, explore just deep enough to sound informed, skip verification, and report success either way. Telling it to be careful (rules files, system prompts) helps until it ignores the instruction, and it ignores the instruction precisely when stakes and pressure are highest, because an instruction is a request.
 
-- Forward-chaining: anchoring on the first plausible step, editing immediately, answering from the first story that fits, and discovering the important unknowns mid-execution.
-- Laziness: shallow exploration, hand-waved impact claims, skipped verification, hollow answer reasoning.
+HOLMES does not make requests. It is code that sits between the model and the world and withholds two permissions until evidence shows up:
 
-It ships as a local OMP extension package. `package.json` declares `omp.extensions`, and `src/main.ts` is the runtime entry point that wires every enforcement surface.
+**Permission to change things.** Before the agent may edit a file or run a state-changing command, it must declare the exact change it intends and prove how much impact that change can have. The proof is checked by plugin code against real bytes: the actual diff, the actual file contents, the actual tool results. What it gets back is not approval but a lease, covering that exact change and nothing else, which expires on its own and evaporates the moment the agent's real action drifts from the declared one. The "while I'm here" extra fix dies at this gate.
 
-Why the framework exists, and the harness-independent logic behind it, is in [FRAMEWORK.md](FRAMEWORK.md).
+**Permission to be done.** A substantive answer does not close just because the agent stopped talking. The agent has to show its reasoning, and the evidence cited in that reasoning is checked against what the plugin watched it actually read during the request. "I verified this" counts for nothing; a passing tool result counts. If the answer arrives without the reasoning, the agent gets exactly one demand to produce it, and a refusal is logged rather than looped on.
+
+The model's own claims never unlock anything; only facts the plugin observed itself can. And trivial work stays free. "What branch am I on?" triggers no ceremony at all, because an enforcement system that taxes everything teaches its operator to uninstall it.
+
+## The two gates
+
+### Changing anything
+
+```mermaid
+flowchart TD
+    W["Agent wants to edit a file<br>or run a state-changing command"] --> L{"Live lease covering<br>this exact change?"}
+    L -->|yes| X["Change executes.<br>Budget ticks down; drift from the<br>declared change kills the lease."]
+    L -->|no| B["Blocked, with the reason<br>and a named next step"]
+    B --> C["holmes_classify:<br>declare the exact change,<br>argue its impact tier"]
+    C --> J["Plugin adjudicates:<br>hard floors from observed facts,<br>byte-level proof certificates,<br>a reviewer that can only raise"]
+    J --> S["Lease granted for that<br>exact change, nothing else"]
+    S --> L
+```
+
+### Closing an answer
+
+```mermaid
+flowchart TD
+    R["User request"] --> T{"Triage"}
+    T -->|trivial| Z["No obligation.<br>Zero ceremony, zero tokens."]
+    Z --> D2["Request closes"]
+    T -->|substantive| O["Obligation: reasoning must be<br>shown and anchored to evidence"]
+    O --> A2["Agent works, answers"]
+    A2 --> V{"Visible reasoning pass, or<br>holmes_checkpoint with evidence<br>matching actual reads?"}
+    V -->|yes| D2
+    V -->|no| M["One repair demand<br>(never repeated)"]
+    M --> V2{"Satisfied now?"}
+    V2 -->|yes| D2
+    V2 -->|no| SV["Soft violation logged.<br>Session never hangs."]
+```
+
+Everything below is the operator manual: the exact tiers, gates, tools, and counters, under the names used in the code. [FRAMEWORK.md](FRAMEWORK.md) is the conceptual deep dive: how agent reasoning fails, why guidance alone cannot fix it, and the design rules behind the enforcement.
 
 ## The cognitive model
 
